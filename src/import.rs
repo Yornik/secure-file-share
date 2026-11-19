@@ -71,11 +71,14 @@ fn percent_decode(segment: &str) -> String {
 }
 
 /// Strip path separators and control characters, keep it to a length that
-/// always fits the metadata chunk with room to spare.
+/// always fits the metadata chunk with room to spare. 120, not 200: it is
+/// a display label, not a filesystem promise, and every platform that
+/// matters has real limits well under 200. `static/app.js` truncates to
+/// the same number for browser uploads, so both paths agree.
 fn sanitize_name(raw: &str) -> String {
     raw.chars()
         .filter(|c| !c.is_control() && *c != '/' && *c != '\\')
-        .take(200)
+        .take(120)
         .collect::<String>()
         .trim()
         .to_owned()

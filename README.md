@@ -32,7 +32,8 @@ in one atomic statement, so two racing downloads can never both win.
 ## The format (it is small on purpose)
 
 ```text
-plaintext   [ metadata JSON <= 64 KiB ] [ data, 4 MiB chunks ] ...
+plaintext   [ metadata JSON <= 64 KiB: name (<= 120 chars), mime, size ]
+            [ data, 4 MiB chunks ] ...
 chunk       nonce (12) || AES-256-GCM ciphertext || tag (16)
 frame       u32 big-endian length || chunk
 end         an empty chunk — truncation fails the tag, not the download

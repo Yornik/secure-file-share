@@ -67,7 +67,9 @@ function showProgress(label, fraction) {
 async function buildFrames(file, key, onProgress) {
   const cryptoKey = await importKey(key);
   const meta = {
-    name: file.name,
+    // 120 code points, the same cap the server applies to URL imports;
+    // the name is a display label, and both paths must agree.
+    name: [...file.name].slice(0, 120).join(""),
     mime: file.type || "application/octet-stream",
     size: file.size,
   };
