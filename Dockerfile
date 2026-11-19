@@ -34,7 +34,17 @@ ARG VERSION=dev
 ARG COMMIT=none
 ENV SFS_BUILD_COMMIT=${COMMIT}
 
-RUN cargo build --release --locked
+# BuildKit gives the COPYed sources their checkout mtime, which is OLDER
+# than the artifacts of the stub build above; cargo's freshness check then
+# sees "not modified" and the real build becomes a 0.14s no-op — and the
+# stub `fn main() {}` ships inside the image, exits 0 and CrashLoops in
+# the cluster. Touch the crate's own inputs (the dependency fingerprints
+# stay cached), then prove the binary is the app before the image is
+# assembled: with no DATABASE_URL the app prints the config error and
+# exits; the stub prints nothing and fails the grep, failing the build.
+RUN find src migrations static -type f -exec touch {} + \
+ && cargo build --release --locked \
+ && ./target/release/secure-file-share 2>&1 | grep -q "DATABASE_URL is required"
 
 FROM scratch
 
