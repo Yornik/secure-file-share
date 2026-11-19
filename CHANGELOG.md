@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.4.0](https://github.com/Yornik/secure-file-share/compare/v0.3.1...v0.4.0) (2026-11-19)
+
+
+### ⚠ BREAKING CHANGES
+
+* DELETE /api/v1/shares/{id} no longer exists. SFS_ADMIN_TOKEN is deprecated in favour of SFS_UPLOAD_TOKEN.
+
+### Features
+
+* control plane - operator revocation by share link ([#11](https://github.com/Yornik/secure-file-share/issues/11)) ([bc9d043](https://github.com/Yornik/secure-file-share/commit/bc9d04390db0a37026540276f49426aad96ce6ad))
+* refuse non-public import hosts (SSRF guard) ([#10](https://github.com/Yornik/secure-file-share/issues/10)) ([c3b313a](https://github.com/Yornik/secure-file-share/commit/c3b313a41808e1b3548c8704245aae8a2c7e8c09))
+* stored-bytes and sweeper metrics, Grafana dashboard ([#9](https://github.com/Yornik/secure-file-share/issues/9)) ([69d46a2](https://github.com/Yornik/secure-file-share/commit/69d46a2d24c24f12b311632408094916f89f1872))
+* upload token, not-public mode, no public delete ([6e7845c](https://github.com/Yornik/secure-file-share/commit/6e7845c78b6f11032c5eb194868628a3477634d2))
+
+
+### Documentation
+
+* red-alert warning on the not-public switch ([0c62c41](https://github.com/Yornik/secure-file-share/commit/0c62c4183bb3afa859d6a168d3157333b46f655d))
+* rewrite the not-public caution in strict STE ([#8](https://github.com/Yornik/secure-file-share/issues/8)) ([7d21845](https://github.com/Yornik/secure-file-share/commit/7d2184552cf12468097b2cb5c430d5072381170c))
+
 ## [0.3.1](https://github.com/Yornik/secure-file-share/compare/v0.3.0...v0.3.1) (2026-11-19)
 
 
