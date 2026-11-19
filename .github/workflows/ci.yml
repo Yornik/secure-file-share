@@ -89,8 +89,12 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # --test-threads=1 on purpose: the integration tests share one
+      # database (each setup() wipes it), so parallel test threads would
+      # race each other's rows. The whole suite runs in well under a
+      # minute; there is nothing to gain from parallelism here.
       - name: cargo test
-        run: cargo test --locked --all-features
+        run: cargo test --locked --all-features -- --test-threads=1
 
   msrv:
     name: msrv

@@ -4,6 +4,10 @@
 //! they skip with a warning, so `cargo test` on a fresh clone stays green.
 //! Everything flows through the public surface: the token check, the frame
 //! reader, the database transaction, the claim and the download stream.
+//!
+//! Run with `--test-threads=1`: every test's setup wipes the shared
+//! database, so parallel threads race each other's rows. CI does this; do
+//! the same locally (`cargo test -- --test-threads=1`).
 
 use std::error::Error;
 
