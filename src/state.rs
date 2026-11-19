@@ -16,6 +16,7 @@ use std::{
     },
 };
 
+use bytes::Bytes;
 use sqlx::PgPool;
 use tokio::io::AsyncWriteExt;
 
@@ -130,8 +131,9 @@ impl ShareWriter<'_> {
     }
 
     /// Write one frame (length prefix included, exactly as the downloader
-    /// will read it back) and count it.
-    pub async fn add_frame(&mut self, frame: Vec<u8>) -> Result<(), crate::error::AppError> {
+    /// will read it back) and count it. `Bytes` so the write reuses the
+    /// reader's buffer instead of copying a 4 MiB frame a second time.
+    pub async fn add_frame(&mut self, frame: Bytes) -> Result<(), crate::error::AppError> {
         let prefix = u32::try_from(frame.len()).unwrap_or(u32::MAX).to_be_bytes();
         let Some(file) = self.file.as_mut() else {
             return Err(crate::error::AppError::Internal(

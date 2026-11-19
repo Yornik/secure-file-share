@@ -23,7 +23,7 @@ use std::{
 };
 
 use axum::{Json, extract::State, http::HeaderMap};
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
@@ -458,11 +458,11 @@ async fn encrypt_stream(
     response: reqwest::Response,
     cap: u64,
 ) -> Result<(), AppError> {
-    writer.add_frame(kem_ct.to_vec()).await?;
+    writer.add_frame(Bytes::copy_from_slice(kem_ct)).await?;
     let nonce = crypto::new_nonce();
     let frame = crypto::encrypt_chunk(key, &nonce, meta)
         .map_err(|_| AppError::Internal("encrypt".into()))?;
-    writer.add_frame(frame).await?;
+    writer.add_frame(Bytes::from(frame)).await?;
 
     let mut stream = response.bytes_stream();
     let mut buf = BytesMut::new();
@@ -480,21 +480,21 @@ async fn encrypt_stream(
             let nonce = crypto::new_nonce();
             let frame = crypto::encrypt_chunk(key, &nonce, &piece)
                 .map_err(|_| AppError::Internal("encrypt".into()))?;
-            writer.add_frame(frame).await?;
+            writer.add_frame(Bytes::from(frame)).await?;
         }
     }
     if !buf.is_empty() {
         let nonce = crypto::new_nonce();
         let frame = crypto::encrypt_chunk(key, &nonce, &buf)
             .map_err(|_| AppError::Internal("encrypt".into()))?;
-        writer.add_frame(frame).await?;
+        writer.add_frame(Bytes::from(frame)).await?;
     }
     // The empty end-of-stream marker, so a truncated upstream cannot look
     // like a complete share on the other side.
     let nonce = crypto::new_nonce();
     let marker = crypto::encrypt_chunk(key, &nonce, &[])
         .map_err(|_| AppError::Internal("encrypt".into()))?;
-    writer.add_frame(marker).await?;
+    writer.add_frame(Bytes::from(marker)).await?;
     Ok(())
 }
 
