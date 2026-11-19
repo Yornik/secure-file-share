@@ -110,7 +110,8 @@ Do this to run the service locally:
 | Variable | Meaning |
 |---|---|
 | `DATABASE_URL` | Postgres DSN. Required. |
-| `SFS_ADMIN_TOKEN` | Bearer token for all write paths. Required, 16 characters or more. The comparison is constant-time. |
+| `SFS_UPLOAD_TOKEN` | Bearer token for the write paths. Required, 16 characters or more. The comparison is constant-time. `SFS_ADMIN_TOKEN`, the name before v0.4, still works. |
+| `NOT_PUBLIC_FACING_TURN_OFF_UPLOAD_TOKEN` | Set to `1` for a deployment no public network can reach. The write paths accept uploads without a token. The name is the warning: route nothing public to this service while it is set. |
 | `SFS_BASE_URL` | Origin for share links. Required. |
 | `SFS_DATA_DIR` | Directory for the ciphertext blobs. Default: `/var/lib/secure-file-share`. Mount a volume here. |
 | `SFS_LISTEN_ADDR` / `SFS_METRICS_ADDR` | Web listener and metrics listener. Defaults: `0.0.0.0:8080` / `0.0.0.0:9090`. |
@@ -121,17 +122,22 @@ Do this to run the service locally:
 
 ### API
 
-All write paths need `Authorization: Bearer <token>`.
+All write paths need `Authorization: Bearer <token>`, unless the
+deployment set `NOT_PUBLIC_FACING_TURN_OFF_UPLOAD_TOKEN`.
 
 ```text
 POST   /api/v1/shares        encrypted frame stream + X-SFS-One-Time, X-SFS-Ttl-Days
 POST   /api/v1/shares/url    {"url": "...", "ttl_days": 7, "one_time": false}
 GET    /api/v1/shares        listing: sizes and times, no names
-DELETE /api/v1/shares/{id}   revoke a share
 GET    /s/{id}               the page that decrypts
 GET    /s/{id}/meta          one_time / burned / stored_size / expires_at
 GET    /s/{id}/blob          the ciphertext, streamed
 ```
+
+There is no `DELETE` on this listener, in any mode. A share dies by
+expiry or by burn, and nothing on the public side can change that. The
+operator revokes a share on the control plane, a separate listener with
+its own token.
 
 ## Build and test
 
@@ -158,8 +164,14 @@ current: crates, actions, base images, digests.
 
 ## Threat model
 
-- The operator is trusted. One admin token exists. A holder of the token
-  can create, list and revoke shares.
+- The operator is trusted. One upload token exists. A holder of the token
+  can create shares. The token does not delete: the public API has no
+  deletion path in any mode, so a leaked upload token cannot burn the
+  archive.
+- A not-public deployment can drop the token
+  (`NOT_PUBLIC_FACING_TURN_OFF_UPLOAD_TOKEN`). Then the network is the
+  door, and the deployment must stay unreachable from the public
+  internet. The variable name says so on purpose.
 - The database holds bookkeeping. The volume holds ciphertext. A database
   dump holds no file name. The bytes on the volume need the unlock
   material from the link.

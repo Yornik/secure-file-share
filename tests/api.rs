@@ -35,7 +35,15 @@ const BASE_URL: &str = "http://test.local";
 
 /// A complete state wired to the test database and a throwaway blob
 /// directory, with size limits tuned down so they are testable.
+/// The default state: the upload token guards the write paths.
 async fn setup() -> Result<Option<(AppState, Router)>, Box<dyn Error>> {
+    setup_with(false).await
+}
+
+/// `not_public = true` builds the state of a deployment that set
+/// `NOT_PUBLIC_FACING_TURN_OFF_UPLOAD_TOKEN`: no token, and the write paths
+/// are open to whatever network can reach them.
+async fn setup_with(not_public: bool) -> Result<Option<(AppState, Router)>, Box<dyn Error>> {
     let Ok(database_url) = std::env::var("SFS_TEST_DATABASE_URL") else {
         log::warn!("SFS_TEST_DATABASE_URL is not set; skipping integration tests");
         return Ok(None);
@@ -61,7 +69,19 @@ async fn setup() -> Result<Option<(AppState, Router)>, Box<dyn Error>> {
         metrics_addr: "127.0.0.1:19090".parse()?,
         database_url,
         data_dir,
-        admin_token: ADMIN_TOKEN.to_owned(),
+        upload_token: if not_public {
+            String::new()
+        } else {
+            ADMIN_TOKEN.to_owned()
+        },
+        not_public_facing_turn_off_upload_token: not_public,
+        // The control plane gets its own coverage in the control-plane
+        // tests; the plain data-plane state does not start one.
+        control_token: String::new(),
+        control_addr: "127.0.0.1:18081".parse()?,
+        // The URL-import tests run a loopback upstream, so they opt in to
+        // private hosts the way a tailnet deployment would.
+        import_allow_private_urls: true,
         base_url: BASE_URL.to_owned(),
         max_upload_bytes: 1_000_000,
         import_max_bytes: 1_000_000,
@@ -315,7 +335,9 @@ async fn end_to_end() -> Result<(), Box<dyn Error>> {
     let (status, _) = call(&mut app, get(&format!("/s/{id}/meta")), Vec::new()).await?;
     assert_eq!(status, StatusCode::GONE);
 
-    // A multi-download share stays alive until revoked.
+    // A multi-download share stays alive until it expires: there is no
+    // revocation on the public side, and the DELETE route is gone in
+    // every mode. A request that would have revoked is now just a 404.
     let (sk2, rnd2) = crypto::new_share_seeds();
     let stream2 = encrypted_stream(
         &sk2,
@@ -354,15 +376,19 @@ async fn end_to_end() -> Result<(), Box<dyn Error>> {
         Vec::new(),
     )
     .await?;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the DELETE route does not exist on the public side, with or without a token"
+    );
+    // The refused delete changes nothing: the share and its blob live on.
     assert_eq!(
         status_of(&mut app, &format!("/s/{id2}/meta")).await?,
-        StatusCode::NOT_FOUND
+        StatusCode::OK
     );
-    // Revocation removed the blob with the row.
     assert!(
-        !tokio::fs::try_exists(blob_path(&state.config.data_dir, &id2)).await?,
-        "revoked share left no blob behind"
+        tokio::fs::try_exists(blob_path(&state.config.data_dir, &id2)).await?,
+        "a 404 delete left the blob in place"
     );
 
     // Unknown ids are a 404, not a 410: nobody should learn that a link
@@ -563,6 +589,64 @@ async fn oversize_is_refused() -> Result<(), Box<dyn Error>> {
     assert!(
         listing.next_entry().await?.is_none(),
         "a refused upload left a file behind"
+    );
+    let _ = tokio::fs::remove_dir_all(&state.config.data_dir).await;
+    Ok(())
+}
+
+/// The not-public mode: `NOT_PUBLIC_FACING_TURN_OFF_UPLOAD_TOKEN` set, no
+/// upload token. The write paths are open to whatever can reach them,
+/// the listing follows the same trust, and the DELETE route is absent
+/// exactly as in token mode.
+#[tokio::test]
+async fn not_public_mode_opens_uploads_only() -> Result<(), Box<dyn Error>> {
+    let Some((state, mut app)) = setup_with(true).await? else {
+        return Ok(());
+    };
+
+    // An upload without any Authorization header is accepted.
+    let (sk_seed, rnd) = crypto::new_share_seeds();
+    let stream = encrypted_stream(
+        &sk_seed,
+        &rnd,
+        &meta_json("lan.txt", "text/plain", 5),
+        b"trusted network",
+    )?;
+    let (status, body) = call(&mut app, post("/api/v1/shares"), stream).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "upload without a token in not-public mode: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let created: Value = serde_json::from_slice(&body)?;
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or("no id")?
+        .to_owned();
+
+    // The listing is open too: no token exists to guard it with.
+    let (status, _) = call(&mut app, get("/api/v1/shares"), Vec::new()).await?;
+    assert_eq!(status, StatusCode::OK, "the listing follows the same trust");
+
+    // Deletion is not available in this mode either: the route is absent.
+    let (status, _) = call(
+        &mut app,
+        delete(&format!("/api/v1/shares/{id}")),
+        Vec::new(),
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "no DELETE route in not-public mode"
+    );
+
+    // And the share itself lives on: 404 did not delete anything.
+    assert_eq!(
+        status_of(&mut app, &format!("/s/{id}/meta")).await?,
+        StatusCode::OK
     );
     let _ = tokio::fs::remove_dir_all(&state.config.data_dir).await;
     Ok(())

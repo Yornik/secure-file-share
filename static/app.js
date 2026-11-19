@@ -190,7 +190,7 @@ async function importFromUrl(url, token, ttlDays, oneTime) {
   const response = await fetch("/api/v1/shares/url", {
     method: "POST",
     headers: {
-      Authorization: "Bearer " + token,
+      ...(token !== "" && { Authorization: "Bearer " + token }),
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ url, ttl_days: ttlDays, one_time: oneTime }),
@@ -208,10 +208,6 @@ async function onSubmit(event) {
   $("result").hidden = true;
 
   const token = $("token").value;
-  if (token === "") {
-    showError("An admin token is needed to create a share.");
-    return;
-  }
   const ttlDays = Number($("ttl").value);
   const oneTime = $("one-time").checked;
   const importUrl = $("import-url").value.trim();
@@ -233,7 +229,7 @@ async function onSubmit(event) {
       showProgress("Encrypting\u2026", fraction / 2);
     });
     const created = await uploadCiphertext(parts, {
-      Authorization: "Bearer " + token,
+      ...(token !== "" && { Authorization: "Bearer " + token }),
       "Content-Type": "application/octet-stream",
       "X-SFS-One-Time": oneTime ? "1" : "0",
       "X-SFS-Ttl-Days": String(ttlDays),

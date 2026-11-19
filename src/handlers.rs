@@ -71,16 +71,23 @@ pub struct ShareMeta {
     expires_at: String,
 }
 
-/// Constant-time bearer check. A timing leak on the comparison would turn
-/// the admin token into something an attacker could bisect character by
-/// character on a public endpoint.
-pub(crate) fn require_admin(headers: &HeaderMap, state: &AppState) -> Result<(), AppError> {
+/// Constant-time bearer check for the upload token. A timing leak on the
+/// comparison would turn the token into something an attacker could
+/// bisect character by character on a public endpoint.
+///
+/// An empty configured token means no guard exists, which only happens
+/// in the not-public mode: there the network itself is the door, and the
+/// variable name warned the operator about it at startup.
+pub(crate) fn require_upload_token(headers: &HeaderMap, state: &AppState) -> Result<(), AppError> {
+    if state.config.upload_token.is_empty() {
+        return Ok(());
+    }
     let value = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .unwrap_or_default();
-    let expected = state.config.admin_token.as_bytes();
+    let expected = state.config.upload_token.as_bytes();
     let provided = value.as_bytes();
     // The length check first is fine: it leaks only the token's length,
     // which the response time of any request already hints at.
@@ -147,14 +154,16 @@ fn serve_asset(name: &str) -> Result<Response, AppError> {
     Ok(response)
 }
 
-/// Admin listing. What an operator sees is exactly what the server knows:
+/// The listing. What an operator sees is exactly what the server knows:
 /// sizes, timestamps, counters. No file names — they are inside the
-/// encrypted metadata chunk and unreadable here.
+/// encrypted metadata chunk and unreadable here. The upload token guards
+/// it; with no token configured (not-public mode) the trusted network
+/// is the guard.
 pub async fn list_shares(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<ShareInfo>>, AppError> {
-    require_admin(&headers, &state)?;
+    require_upload_token(&headers, &state)?;
     let rows = sqlx::query(
         "SELECT id, stored_size, one_time, downloads, \
                 to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created, \
@@ -180,12 +189,19 @@ pub async fn list_shares(
 /// Browser-encrypted upload. The body is the frame stream the JavaScript in
 /// `static/app.js` built; this handler never touches a key, it only checks
 /// frame shapes, writes the blob to the volume and keeps the bookkeeping.
+/// The upload token guards the door — unless the deployment declared
+/// itself not public-facing, in which case the network is the door and
+/// the token check yields. There is deliberately no revocation on this
+/// side: shares die by expiry or burn, and the control plane (a separate
+/// listener with its own token) is the only place an operator deletes.
 pub async fn create_share(
     State(state): State<AppState>,
     headers: HeaderMap,
     request: Request,
 ) -> Result<Json<CreateResponse>, AppError> {
-    require_admin(&headers, &state)?;
+    if !state.config.not_public_facing_turn_off_upload_token {
+        require_upload_token(&headers, &state)?;
+    }
     let one_time = parse_flag(&headers, "x-sfs-one-time");
     let ttl_days = parse_ttl(&headers, &state);
     let stream = request.into_body().into_data_stream();
@@ -207,30 +223,6 @@ pub async fn create_share(
         id: stored.id,
         expires_at,
     }))
-}
-
-pub async fn revoke_share(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Result<StatusCode, AppError> {
-    require_admin(&headers, &state)?;
-    let result = sqlx::query("DELETE FROM shares WHERE id = $1")
-        .bind(&id)
-        .execute(&state.pool)
-        .await?;
-    if result.rows_affected() == 0 {
-        Err(AppError::NotFound)
-    } else {
-        // The row is gone, so nothing points at the blob anymore; remove it
-        // best-effort and let the sweeper catch any miss.
-        if let Err(error) =
-            tokio::fs::remove_file(crate::state::blob_path(&state.config.data_dir, &id)).await
-        {
-            log::warn!("blob for revoked share {id} did not remove: {error}");
-        }
-        Ok(StatusCode::NO_CONTENT)
-    }
 }
 
 /// Public share metadata, just enough for the page to decide what to show

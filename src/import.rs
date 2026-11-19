@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     crypto::{self, CHUNK_PLAINTEXT},
     error::AppError,
-    handlers::{ImportResponse, require_admin},
+    handlers::{ImportResponse, require_upload_token},
     state::{AppState, Metrics, ShareWriter, clamp_ttl},
 };
 
@@ -111,7 +111,9 @@ pub async fn import_share(
     headers: HeaderMap,
     Json(request): Json<ImportRequest>,
 ) -> Result<Json<ImportResponse>, AppError> {
-    require_admin(&headers, &state)?;
+    if !state.config.not_public_facing_turn_off_upload_token {
+        require_upload_token(&headers, &state)?;
+    }
     let url = reqwest::Url::parse(&request.url)
         .map_err(|error| AppError::BadRequest(format!("not a valid URL: {error}")))?;
     if url.scheme() != "http" && url.scheme() != "https" {

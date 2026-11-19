@@ -6,7 +6,7 @@ use axum::{
     http::{HeaderName, HeaderValue, header},
     middleware::{self, Next},
     response::Response,
-    routing::{delete, get, post},
+    routing::{get, post},
 };
 
 use crate::{handlers, import, state::AppState};
@@ -25,7 +25,10 @@ pub fn app(state: AppState) -> Router {
             get(handlers::list_shares).post(handlers::create_share),
         )
         .route("/api/v1/shares/url", post(import::import_share))
-        .route("/api/v1/shares/{id}", delete(handlers::revoke_share))
+        // Deliberately no DELETE route on this listener: the public side
+        // cannot revoke a share in any mode. Shares die by expiry or burn;
+        // the control plane on its own listener is the only deletion door,
+        // and it carries its own token.
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
 }

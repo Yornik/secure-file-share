@@ -16,7 +16,27 @@ pub struct Config {
     /// `<id>.sfs` file per share. The database holds only bookkeeping, so
     /// the blob ceiling is the volume, not what is healthy for a database.
     pub data_dir: String,
-    pub admin_token: String,
+    /// Bearer token for the two write paths (upload, URL import). Empty
+    /// only in the not-public mode, where the network itself is the door.
+    pub upload_token: String,
+    /// Set for a deployment that is not public-facing: the write paths
+    /// accept uploads without the token. The variable name is the warning:
+    /// route nothing public to a service with this set, and give it a
+    /// control token so revocation stays possible.
+    pub not_public_facing_turn_off_upload_token: bool,
+    /// Token for the control plane (the separate revocation listener).
+    /// Empty means the control plane does not start. A different secret
+    /// from the upload token on purpose: the door that deletes shares
+    /// must not be the door the not-public mode leaves open.
+    pub control_token: String,
+    /// The control-plane listener. Nothing routes to it from outside the
+    /// cluster; an operator reaches it with a port-forward.
+    pub control_addr: SocketAddr,
+    /// The URL importer refuses hosts that resolve to private, loopback,
+    /// link-local or otherwise non-public addresses (SSRF guard). The
+    /// operator opts in to private imports — a trusted tailnet, say —
+    /// with this switch. Cloud metadata (169.254.x.x) is never public.
+    pub import_allow_private_urls: bool,
     pub base_url: String,
     /// Hard ceiling on stored ciphertext per share, browser upload and URL
     /// import alike. Enforced frame by frame, not by trusting Content-Length.
@@ -58,15 +78,71 @@ impl Config {
         );
         let database_url = required("DATABASE_URL", &mut errors);
         let data_dir = optional("SFS_DATA_DIR", "/var/lib/secure-file-share");
-        let admin_token = required("SFS_ADMIN_TOKEN", &mut errors);
-        if let Some(token) = admin_token.as_deref()
-            && token.len() < 16
-        {
-            errors.push(format!(
-                "SFS_ADMIN_TOKEN is {len} characters; 16 minimum, so tokens are never guessable",
-                len = token.len()
-            ));
-        }
+        // unwrap_or(false) is only reachable when the spelling was wrong,
+        // and then errors is non-empty and the whole config fails anyway.
+        let not_public_facing_turn_off_upload_token =
+            parse_bool("NOT_PUBLIC_FACING_TURN_OFF_UPLOAD_TOKEN", &mut errors).unwrap_or(false);
+        // SFS_ADMIN_TOKEN is the name this variable had before v0.4. It
+        // still works so an unchanged secret cannot break an upgrade, and
+        // the log line says which name the deployment uses.
+        let upload_token = match env::var("SFS_UPLOAD_TOKEN") {
+            Ok(value) => Some((value, false)),
+            Err(_) => env::var("SFS_ADMIN_TOKEN").ok().map(|value| (value, true)),
+        };
+        let upload_token = match upload_token {
+            Some((value, legacy)) => {
+                if legacy {
+                    log::warn!("SFS_ADMIN_TOKEN is the name before v0.4; set SFS_UPLOAD_TOKEN");
+                }
+                if value.trim().is_empty() {
+                    if not_public_facing_turn_off_upload_token {
+                        Some(String::new())
+                    } else {
+                        errors.push(
+                            "SFS_UPLOAD_TOKEN is required (or set NOT_PUBLIC_FACING_TURN_OFF_UPLOAD_TOKEN for a not-public deployment)"
+                                .to_owned(),
+                        );
+                        None
+                    }
+                } else if value.len() < 16 {
+                    errors.push(format!(
+                        "SFS_UPLOAD_TOKEN is {len} characters; 16 minimum, so tokens are never guessable",
+                        len = value.len()
+                    ));
+                    None
+                } else {
+                    Some(value)
+                }
+            }
+            None if not_public_facing_turn_off_upload_token => Some(String::new()),
+            None => {
+                errors.push(
+                    "SFS_UPLOAD_TOKEN is required unless NOT_PUBLIC_FACING_TURN_OFF_UPLOAD_TOKEN is set"
+                        .to_owned(),
+                );
+                None
+            }
+        };
+        let control_token = match env::var("SFS_CONTROL_TOKEN") {
+            Ok(value) if value.trim().is_empty() => Some(String::new()),
+            Ok(value) if value.len() < 16 => {
+                errors.push(format!(
+                    "SFS_CONTROL_TOKEN is {len} characters; 16 minimum, so the control plane is never guessable",
+                    len = value.len()
+                ));
+                None
+            }
+            Ok(value) => Some(value),
+            Err(_) => Some(String::new()),
+        };
+        let control_addr = parse_addr(
+            env::var("SFS_CONTROL_ADDR"),
+            "SFS_CONTROL_ADDR",
+            "0.0.0.0:8081",
+            &mut errors,
+        );
+        let import_allow_private_urls =
+            parse_bool("SFS_IMPORT_ALLOW_PRIVATE_URLS", &mut errors).unwrap_or(false);
         let base_url = required("SFS_BASE_URL", &mut errors);
         if let Some(url) = base_url.as_deref()
             && !(url.starts_with("http://") || url.starts_with("https://"))
@@ -121,9 +197,13 @@ impl Config {
         match (
             listen_addr,
             metrics_addr,
+            control_addr,
             database_url,
             data_dir,
-            admin_token,
+            upload_token,
+            not_public_facing_turn_off_upload_token,
+            control_token,
+            import_allow_private_urls,
             base_url,
             max_upload_bytes,
             import_max_bytes,
@@ -134,9 +214,13 @@ impl Config {
             (
                 Some(listen_addr),
                 Some(metrics_addr),
+                Some(control_addr),
                 Some(database_url),
                 data_dir,
-                Some(admin_token),
+                Some(upload_token),
+                not_public_facing_turn_off_upload_token,
+                Some(control_token),
+                import_allow_private_urls,
                 Some(base_url),
                 Some(max_upload_bytes),
                 Some(import_max_bytes),
@@ -146,9 +230,13 @@ impl Config {
             ) if errors.is_empty() => Ok(Self {
                 listen_addr,
                 metrics_addr,
+                control_addr,
                 database_url,
                 data_dir,
-                admin_token,
+                upload_token,
+                not_public_facing_turn_off_upload_token,
+                control_token,
+                import_allow_private_urls,
                 base_url: base_url.trim_end_matches('/').to_owned(),
                 max_upload_bytes,
                 import_max_bytes,
@@ -176,6 +264,23 @@ fn optional(name: &str, default: &str) -> String {
     match env::var(name) {
         Ok(value) if !value.trim().is_empty() => value,
         _ => default.to_owned(),
+    }
+}
+
+/// A boolean variable: absent or empty means false, and only the explicit
+/// spellings count, so a typo cannot silently arm or disarm a door.
+fn parse_bool(name: &str, errors: &mut Vec<String>) -> Option<bool> {
+    match env::var(name) {
+        Err(_) => Some(false),
+        Ok(value) if value.trim().is_empty() => Some(false),
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => {
+                errors.push(format!("{name} must be 1/true/yes/on or 0/false/no/off"));
+                None
+            }
+        },
     }
 }
 
