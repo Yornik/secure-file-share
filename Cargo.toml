@@ -20,8 +20,9 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.8.9"
-# tokio is pulled in by axum; the features below are what the binary itself uses.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync", "io-util"] }
+# tokio is pulled in by axum; the features below are what the binary itself
+# uses. `fs` reads and streams the ciphertext files off the volume.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync", "io-util", "fs"] }
 # tls-none: the only database this is deployed against is a CloudNativePG cluster
 # inside the same Kubernetes cluster, reached with sslmode=disable. Enabling a TLS
 # backend here would add a C toolchain to the musl build for a connection that
@@ -33,6 +34,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal
 sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "tls-none", "postgres", "migrate", "macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Hybrid post-quantum key establishment (FIPS 203, ML-KEM-1024): the file key
+# is derived from an encapsulated secret plus a random seed, so the URL
+# fragment unlocks the share even against a future quantum attacker, and
+# the bulk cipher is AES-256-GCM, which stands on its own either way.
+ml-kem = "0.3.4"
+sha2 = "0.10"
+hkdf = "0.12"
 aes-gcm = "0.11.1"
 rand = "0.10.4"
 # Constant-time comparison for the admin bearer token.

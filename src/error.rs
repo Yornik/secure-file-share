@@ -58,6 +58,15 @@ impl From<sqlx::Error> for AppError {
     }
 }
 
+impl AppError {
+    /// A blob-file error (create, write, rename, read): logged here, kept
+    /// out of the response for the same reason as the database detail.
+    pub fn io(error: &std::io::Error) -> Self {
+        log::error!("blob file error: {error}");
+        Self::Internal("blob file".to_owned())
+    }
+}
+
 impl From<crate::frame::FrameError> for AppError {
     fn from(error: crate::frame::FrameError) -> Self {
         match error {

@@ -25,8 +25,15 @@ pub enum FrameError {
     Io(String),
 }
 
-/// The first frame carries the metadata chunk, which has a different (much
-/// smaller) size limit than the data chunks after it.
+/// The first frame is the ML-KEM-1024 ciphertext: exactly
+/// `crate::crypto::KEM_CT_LEN` bytes, enforced as a range here and as an
+/// exact length by the writer that finishes the stream.
+pub fn max_kem_ct() -> usize {
+    crate::crypto::KEM_CT_LEN
+}
+
+/// The second frame carries the metadata chunk, which has its own (much
+/// smaller) size limit.
 pub fn max_meta_ct() -> usize {
     META_PLAINTEXT_LIMIT + NONCE_LEN + TAG_LEN
 }
@@ -52,7 +59,6 @@ pub fn put_frame(out: &mut BytesMut, data: &[u8]) {
 pub struct FrameReader<S, E> {
     stream: S,
     buf: BytesMut,
-    first: bool,
     frames: u32,
     stored_ct: u64,
     cap: u64,
@@ -68,7 +74,6 @@ where
         Self {
             stream,
             buf: BytesMut::new(),
-            first: true,
             frames: 0,
             stored_ct: 0,
             cap,
@@ -76,10 +81,11 @@ where
         }
     }
 
-    /// Next validated frame (nonce-ciphertext-tag, without the prefix), or
-    /// `None` at a clean end of stream. A stream that stops mid-frame or
-    /// without the empty final marker is an error, not a short share: a
-    /// downloader would otherwise have to guess whether the tail is missing.
+    /// Next validated frame, or `None` at a clean end of stream. Position
+    /// matters: frame 0 is the ML-KEM-1024 ciphertext, frame 1 the metadata
+    /// chunk, everything after a data chunk. A stream that stops mid-frame
+    /// is an error, not a short share: a downloader would otherwise have
+    /// to guess whether the tail is missing.
     pub async fn next_frame(&mut self) -> Result<Option<Vec<u8>>, FrameError> {
         loop {
             // BytesMut is always one contiguous buffer, so chunk() is the
@@ -87,10 +93,10 @@ where
             // guards the slicing needs.
             if let Some((prefix, _)) = self.buf.chunk().split_first_chunk::<4>() {
                 let len = u32::from_be_bytes(*prefix);
-                let max = if self.first {
-                    max_meta_ct()
-                } else {
-                    max_chunk_ct()
+                let (max, which) = match self.frames {
+                    0 => (max_kem_ct(), "encapsulation"),
+                    1 => (max_meta_ct(), "metadata"),
+                    _ => (max_chunk_ct(), "data"),
                 };
                 let Some(len) = usize::try_from(len)
                     .ok()
@@ -102,14 +108,12 @@ where
                 };
                 if len > max {
                     return Err(FrameError::Malformed(format!(
-                        "the {which} frame is larger than the format allows ({len} > {max} bytes)",
-                        which = if self.first { "metadata" } else { "data" }
+                        "the {which} frame is larger than the format allows ({len} > {max} bytes)"
                     )));
                 }
                 if self.buf.remaining() >= 4 + len {
                     self.buf.advance(4);
                     let frame = self.buf.split_to(len).to_vec();
-                    self.first = false;
                     self.frames += 1;
                     self.stored_ct += u64::from(4_u32) + len as u64;
                     if self.stored_ct > self.cap {

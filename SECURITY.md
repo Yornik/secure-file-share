@@ -17,12 +17,16 @@ anything you would not paste into a public issue.
 
 The service has exactly two doors, and their promises differ:
 
-- **Browser uploads are zero-knowledge.** The key is generated in the
-  browser, the file is encrypted before it leaves the page, and the key
-  travels only in the URL fragment, which browsers never send. The server
-  parses frame lengths and stores ciphertext; even the file name is inside
-  the encrypted metadata chunk. The database holds nothing decryptable and
-  nothing that names a file.
+- **Browser uploads are zero-knowledge.** The unlock material is generated
+  in the browser — a 64-byte ML-KEM-1024 keygen seed and a 256-bit random
+  value — the file is encrypted with the hybrid key before it leaves the
+  page, and the material travels only in the URL fragment, which browsers
+  never send. The server parses frame lengths and stores ciphertext; even
+  the file name is inside the encrypted metadata chunk. The key is a
+  hybrid: HKDF-SHA256 over the ML-KEM-1024 shared secret and the random
+  value, so breaking the KEM alone or guessing the random value alone is
+  not enough. Postgres holds only bookkeeping; the volume holds only
+  ciphertext bytes; neither ever holds anything that names a file.
 - **URL imports are not zero-knowledge for the plaintext, by definition.**
   The endpoint (admin-token only) fetches a file the server can reach and
   encrypts it with a fresh key. During the import the plaintext transits
@@ -35,9 +39,12 @@ Operational assumptions:
 - One admin token, compared in constant time, no accounts. Anyone holding
   the token can create, list and revoke shares; treat it like a password
   and put it in a SOPS-encrypted secret, never in a manifest in the clear.
-- The database is trusted with ciphertext. Expiry and burn-after-reading
-  are enforced at claim time in the same statement that counts the
-  download, so races cannot double-spend a one-time share.
+- The database is trusted with bookkeeping and the volume with ciphertext.
+  Expiry and burn-after-reading are enforced at claim time in the same
+  statement that counts the download, so races cannot double-spend a
+  one-time share. A blob file only becomes a share after the whole stream
+  validates and fsyncs; a partial upload is a temporary file the sweeper
+  removes, and its bookkeeping row rolls back with it.
 - No rate limiting is built in (v0.1); the production deployment sits
   behind Traefik's fail2ban middleware. Share ids carry 128 bits of
   entropy, so enumerating them is not a strategy.

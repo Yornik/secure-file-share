@@ -1,13 +1,23 @@
 //! Shared state and the counters the metrics endpoint exposes. Counters are
 //! plain atomics: the only thing a restart loses is a number, and the
 //! database remains the single source of truth for everything that matters.
+//!
+//! Storage is two places, each doing what it is good at: ciphertext blobs
+//! are plain files on a volume, bookkeeping is rows in Postgres. The
+//! database never holds a byte of payload — a claim, a revoke or an expiry
+//! can be decided atomically in SQL, while a 2 GiB blob streams off the
+//! volume without ever being the database's problem.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use sqlx::PgPool;
+use tokio::io::AsyncWriteExt;
 
 use crate::config::Config;
 
@@ -36,35 +46,53 @@ pub struct AppState {
     pub http: reqwest::Client,
 }
 
-/// A share being written into the database, frame by frame. Both upload
-/// paths build one: the browser-encrypted upload feeds it frames from the
-/// request body, the URL import feeds frames it encrypts itself. Everything
-/// lives inside one transaction, so a stream that turns out malformed
-/// mid-way rolls back and leaves no orphan rows behind.
+/// Final resting place of one share's ciphertext: `<data_dir>/<id>.sfs`.
+/// The id is the file name, so a bookkeeping row can always find its blob,
+/// and a blob without a row is an orphan the sweeper removes.
+pub fn blob_path(data_dir: &str, id: &str) -> PathBuf {
+    Path::new(data_dir).join(format!("{id}.sfs"))
+}
+
+/// A share being written, frame by frame, to a file that does not exist yet.
+/// Both upload paths build one: the browser-encrypted upload feeds it frames
+/// from the request body, the URL import feeds frames it encrypts itself.
+///
+/// The frames land in `<data_dir>/<id>.tmp-<random>` and are renamed to
+/// `<id>.sfs` only after the stream validates, so a partial upload is never
+/// a share: a crash or a malformed stream leaves only a temporary file the
+/// sweeper removes, and the bookkeeping row rolls back with it.
 pub struct ShareWriter<'a> {
-    tx: sqlx::Transaction<'a, sqlx::Postgres>,
+    /// `Some` until `finish()` takes it: the `Drop` guard below makes
+    /// moving fields out of this struct illegal without it.
+    tx: Option<sqlx::Transaction<'a, sqlx::Postgres>>,
+    /// `Some` until `finish()` syncs and closes it; the `Drop` guard makes
+    /// moving the file out otherwise illegal.
+    file: Option<tokio::fs::File>,
+    tmp_path: PathBuf,
     id: String,
-    seq: i32,
     stored: i64,
     frames: u32,
+    first_len: usize,
     last_len: usize,
 }
 
 impl ShareWriter<'_> {
-    /// Open the transaction and insert the share row. `chunk_count` and
-    /// `stored_size` are still placeholders here; `finish()` writes the real
-    /// values, and without it the transaction rolls back and the row never
-    /// existed.
+    /// Open the transaction, insert the bookkeeping row, and open the
+    /// temporary blob file. `stored_size` is still a placeholder;
+    /// `finish()` writes the real value, and without it the transaction
+    /// rolls back and neither the row nor the blob ever existed.
+    #[allow(clippy::too_many_arguments)]
     pub async fn begin(
         pool: &PgPool,
+        data_dir: &str,
         one_time: bool,
         ttl_days: i32,
-    ) -> Result<(Self, String, String), sqlx::Error> {
+    ) -> Result<(Self, String, String), crate::error::AppError> {
         let id = crate::crypto::new_id();
         let mut tx = pool.begin().await?;
         sqlx::query(
-            "INSERT INTO shares (id, stored_size, chunk_count, one_time, expires_at)
-             VALUES ($1, 0, 0, $2, now() + make_interval(days => $3))",
+            "INSERT INTO shares (id, stored_size, one_time, expires_at) \
+             VALUES ($1, 0, $2, now() + make_interval(days => $3))",
         )
         .bind(&id)
         .bind(one_time)
@@ -78,39 +106,63 @@ impl ShareWriter<'_> {
         .bind(&id)
         .fetch_one(&mut *tx)
         .await?;
+        let tmp_path = Path::new(data_dir).join(format!("{id}.tmp-{}", crate::crypto::new_id()));
+        let file = tokio::fs::File::create(&tmp_path).await.map_err(|error| {
+            log::error!("cannot create the blob file in {data_dir}: {error}");
+            crate::error::AppError::Internal("blob file".into())
+        })?;
         let writer = Self {
-            tx,
+            tx: Some(tx),
+            file: Some(file),
+            tmp_path,
             id,
-            seq: 0,
             stored: 0,
             frames: 0,
+            first_len: 0,
             last_len: 0,
         };
         let id = writer.id.clone();
         Ok((writer, id, expires_at))
     }
 
-    pub async fn add_frame(&mut self, frame: Vec<u8>) -> Result<(), sqlx::Error> {
-        sqlx::query("INSERT INTO share_chunks (share_id, seq, data) VALUES ($1, $2, $3)")
-            .bind(&self.id)
-            .bind(self.seq)
-            .bind(&frame)
-            .execute(&mut *self.tx)
-            .await?;
-        self.stored += i64::try_from(4 + frame.len()).unwrap_or(i64::MAX);
+    /// Write one frame (length prefix included, exactly as the downloader
+    /// will read it back) and count it.
+    pub async fn add_frame(&mut self, frame: Vec<u8>) -> Result<(), crate::error::AppError> {
+        let prefix = u32::try_from(frame.len()).unwrap_or(u32::MAX).to_be_bytes();
+        let Some(file) = self.file.as_mut() else {
+            return Err(crate::error::AppError::Internal(
+                "writer already finished".into(),
+            ));
+        };
+        file.write_all(&prefix)
+            .await
+            .map_err(|error| crate::error::AppError::io(&error))?;
+        file.write_all(&frame)
+            .await
+            .map_err(|error| crate::error::AppError::io(&error))?;
+        self.stored += i64::from(4) + i64::try_from(frame.len()).unwrap_or(i64::MAX);
+        if self.frames == 0 {
+            self.first_len = frame.len();
+        }
         self.frames += 1;
-        self.seq += 1;
         self.last_len = frame.len();
         Ok(())
     }
 
-    /// Validate the stream's shape and commit. The last frame must be the
-    /// empty end-of-stream marker; without it a truncated stream would look
-    /// like a complete share.
+    /// Validate the stream's shape and publish. Frame 0 must be the
+    /// ML-KEM-1024 ciphertext, the last frame the empty end-of-stream
+    /// marker; without the marker a truncated stream would look like a
+    /// complete share. The blob is fsynced, renamed into place, the
+    /// directory entry fsynced too, and only then does the row commit.
     pub async fn finish(mut self) -> Result<StoredShare, crate::error::AppError> {
-        if self.frames < 2 {
+        if self.frames < 3 {
             return Err(crate::error::AppError::BadRequest(
-                "a share needs a metadata frame and the end-of-stream marker".into(),
+                "a share needs an encapsulation frame, a metadata frame and the end-of-stream marker".into(),
+            ));
+        }
+        if self.first_len != crate::crypto::KEM_CT_LEN {
+            return Err(crate::error::AppError::BadRequest(
+                "frame 0 must be the ML-KEM-1024 ciphertext (1568 bytes)".into(),
             ));
         }
         if self.last_len != crate::frame::empty_frame_ct() {
@@ -118,18 +170,64 @@ impl ShareWriter<'_> {
                 "the stream does not end with the end-of-stream marker".into(),
             ));
         }
-        sqlx::query("UPDATE shares SET stored_size = $2, chunk_count = $3 WHERE id = $1")
+        if let Some(file) = self.file.as_mut() {
+            file.sync_all()
+                .await
+                .map_err(|error| crate::error::AppError::io(&error))?;
+        }
+        // Close the handle before the rename: an open File keeps the fsync
+        // from being the last word on some platforms.
+        drop(self.file.take());
+        let final_path = blob_path(
+            self.tmp_path
+                .parent()
+                .and_then(Path::to_str)
+                .ok_or_else(|| crate::error::AppError::Internal("blob path".into()))?,
+            &self.id,
+        );
+        tokio::fs::rename(&self.tmp_path, &final_path)
+            .await
+            .map_err(|error| crate::error::AppError::io(&error))?;
+        // The rename is durable only once the directory entry is synced.
+        if let Some(parent) = final_path.parent()
+            && let Ok(dir) = tokio::fs::File::open(parent).await
+        {
+            let _ = dir.sync_all().await;
+        }
+        let Some(tx) = self.tx.as_mut() else {
+            return Err(crate::error::AppError::Internal(
+                "writer already finished".into(),
+            ));
+        };
+        sqlx::query("UPDATE shares SET stored_size = $2 WHERE id = $1")
             .bind(&self.id)
             .bind(self.stored)
-            .bind(i32::try_from(self.frames).unwrap_or(i32::MAX))
-            .execute(&mut *self.tx)
+            .execute(&mut **tx)
             .await?;
-        self.tx.commit().await?;
+        let tx = self
+            .tx
+            .take()
+            .ok_or_else(|| crate::error::AppError::Internal("writer already finished".into()))?;
+        tx.commit().await?;
         Ok(StoredShare {
-            id: self.id,
+            id: self.id.clone(),
             stored: self.stored,
             frames: self.frames,
         })
+    }
+}
+
+impl Drop for ShareWriter<'_> {
+    /// A writer dropped without `finish()` rolls back and takes its
+    /// temporary blob with it: the file is open, the transaction
+    /// uncommitted. Best-effort on purpose; the sweeper removes stray
+    /// `.tmp-` files older than an hour whatever happens here. The removal
+    /// is blocking, but it only runs on a failed-upload path that is about
+    /// to end anyway.
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_file(&self.tmp_path) {
+            log::debug!("sweeper will remove {}: {error}", self.tmp_path.display());
+        }
     }
 }
 

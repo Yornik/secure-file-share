@@ -1,13 +1,15 @@
-//! Integration tests against the real router and a real Postgres.
+//! Integration tests against the real router, a real Postgres and a real
+//! blob directory.
 //!
 //! Set `SFS_TEST_DATABASE_URL` (the CI job does) and these run; without it
 //! they skip with a warning, so `cargo test` on a fresh clone stays green.
 //! Everything flows through the public surface: the token check, the frame
-//! reader, the database transaction, the claim and the download stream.
+//! reader, the blob file, the claim and the download stream.
 //!
 //! Run with `--test-threads=1`: every test's setup wipes the shared
-//! database, so parallel threads race each other's rows. CI does this; do
-//! the same locally (`cargo test -- --test-threads=1`).
+//! database, so parallel threads race each other's rows. Each run gets its
+//! own blob directory, but one serialized database beats flaky checks. CI
+//! does this; do the same locally (`cargo test -- --test-threads=1`).
 
 use std::error::Error;
 
@@ -25,14 +27,14 @@ use secure_file_share::{
     crypto,
     frame::put_frame,
     router,
-    state::{AppState, Metrics},
+    state::{AppState, Metrics, blob_path},
 };
 
 const ADMIN_TOKEN: &str = "test-admin-token-0123456789abcdef";
 const BASE_URL: &str = "http://test.local";
 
-/// A complete state wired to the test database, with defaults tuned down so
-/// the size limits are testable.
+/// A complete state wired to the test database and a throwaway blob
+/// directory, with size limits tuned down so they are testable.
 async fn setup() -> Result<Option<(AppState, Router)>, Box<dyn Error>> {
     let Ok(database_url) = std::env::var("SFS_TEST_DATABASE_URL") else {
         log::warn!("SFS_TEST_DATABASE_URL is not set; skipping integration tests");
@@ -47,10 +49,18 @@ async fn setup() -> Result<Option<(AppState, Router)>, Box<dyn Error>> {
     // for as long as the developer's throwaway database lives.
     sqlx::query("DELETE FROM shares").execute(&pool).await?;
 
+    let data_dir = std::env::temp_dir().join(format!("sfs-test-{}", crypto::new_id()));
+    tokio::fs::create_dir_all(&data_dir).await?;
+    let data_dir = data_dir
+        .to_str()
+        .ok_or("temp path is not valid UTF-8")?
+        .to_owned();
+
     let config = Config {
         listen_addr: "127.0.0.1:18080".parse()?,
         metrics_addr: "127.0.0.1:19090".parse()?,
         database_url,
+        data_dir,
         admin_token: ADMIN_TOKEN.to_owned(),
         base_url: BASE_URL.to_owned(),
         max_upload_bytes: 1_000_000,
@@ -60,7 +70,7 @@ async fn setup() -> Result<Option<(AppState, Router)>, Box<dyn Error>> {
         sweep_interval: std::time::Duration::from_secs(3600),
     };
     let state = AppState {
-        config,
+        config: config.clone(),
         pool,
         metrics: std::sync::Arc::new(Metrics::default()),
         http: reqwest::Client::new(),
@@ -110,32 +120,39 @@ fn meta_json(name: &str, mime: &str, size: u64) -> Vec<u8> {
         .into_bytes()
 }
 
-/// Build a complete encrypted stream: metadata, data, end marker.
+/// Build a complete encrypted stream, unlock material included:
+/// [encapsulation][metadata][data][end marker], framed.
 fn encrypted_stream(
-    key: &[u8; crypto::KEY_LEN],
+    sk_seed: &[u8; crypto::SK_SEED_LEN],
+    rnd: &[u8; crypto::RND_LEN],
     meta: &[u8],
     data: &[u8],
 ) -> Result<Vec<u8>, Box<dyn Error>> {
+    let (kem_ct, file_key) = crypto::kem_encapsulate(sk_seed, rnd);
     let mut out = bytes::BytesMut::new();
-    let meta_frame = crypto::encrypt_chunk(key, &crypto::new_nonce(), meta)
+    put_frame(&mut out, &kem_ct);
+    let meta_frame = crypto::encrypt_chunk(&file_key, &crypto::new_nonce(), meta)
         .map_err(|e| Box::new(e) as Box<dyn Error>)?;
     put_frame(&mut out, &meta_frame);
-    let data_frame = crypto::encrypt_chunk(key, &crypto::new_nonce(), data)
+    let data_frame = crypto::encrypt_chunk(&file_key, &crypto::new_nonce(), data)
         .map_err(|e| Box::new(e) as Box<dyn Error>)?;
     put_frame(&mut out, &data_frame);
-    let marker = crypto::encrypt_chunk(key, &crypto::new_nonce(), &[])
+    let marker = crypto::encrypt_chunk(&file_key, &crypto::new_nonce(), &[])
         .map_err(|e| Box::new(e) as Box<dyn Error>)?;
     put_frame(&mut out, &marker);
     Ok(out.to_vec())
 }
 
-/// Parse a downloaded stream back into frames and decrypt them.
+/// Parse a downloaded stream back into plaintext frames, proving the whole
+/// post-quantum hybrid round-trips through the server's own primitives.
 fn decrypt_stream(
-    key: &[u8; crypto::KEY_LEN],
+    sk_seed: &[u8; crypto::SK_SEED_LEN],
+    rnd: &[u8; crypto::RND_LEN],
     stream: &[u8],
 ) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
     let mut frames = Vec::new();
     let mut offset = 0_usize;
+    let mut file_key: Option<[u8; crypto::KEY_LEN]> = None;
     while offset + 4 <= stream.len() {
         let prefix = stream
             .get(offset..offset + 4)
@@ -143,10 +160,19 @@ fn decrypt_stream(
         let len = u32::from_be_bytes(prefix.try_into()?) as usize;
         let end = offset + 4 + len;
         let frame = stream.get(offset + 4..end).ok_or("truncated frame")?;
-        frames.push(
-            crypto::decrypt_chunk(key, frame)
-                .map_err(|_| "decrypt failed: wrong key or corrupted share".to_owned())?,
-        );
+        if file_key.is_none() {
+            // Frame 0: the raw ML-KEM-1024 ciphertext.
+            let ct: [u8; crypto::KEM_CT_LEN] = frame
+                .try_into()
+                .map_err(|_| "kem frame is the wrong size")?;
+            file_key = Some(crypto::kem_decapsulate(sk_seed, rnd, &ct));
+        } else {
+            let key = file_key.as_ref().ok_or("no key")?;
+            frames.push(
+                crypto::decrypt_chunk(key, frame)
+                    .map_err(|_| "decrypt failed: wrong key or corrupted share".to_owned())?,
+            );
+        }
         offset = end;
     }
     if offset != stream.len() {
@@ -190,11 +216,13 @@ async fn end_to_end() -> Result<(), Box<dyn Error>> {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
     // A stream without the end-of-stream marker is refused whole.
-    let key = crypto::new_key();
+    let (sk_seed, rnd) = crypto::new_share_seeds();
+    let (kem_ct, file_key) = crypto::kem_encapsulate(&sk_seed, &rnd);
     let markerless = {
         let mut out = bytes::BytesMut::new();
+        put_frame(&mut out, &kem_ct);
         let meta = crypto::encrypt_chunk(
-            &key,
+            &file_key,
             &crypto::new_nonce(),
             &meta_json("a.bin", "text/plain", 1),
         )
@@ -209,7 +237,8 @@ async fn end_to_end() -> Result<(), Box<dyn Error>> {
     // then the link is dead.
     let plaintext = b"hello from the integration test".to_vec();
     let stream = encrypted_stream(
-        &key,
+        &sk_seed,
+        &rnd,
         &meta_json("hello.txt", "text/plain", plaintext.len() as u64),
         &plaintext,
     )?;
@@ -237,6 +266,12 @@ async fn end_to_end() -> Result<(), Box<dyn Error>> {
         .to_owned();
     assert!(created.get("expires_at").is_some(), "expiry is announced");
 
+    // The blob is a file on the volume now, and it begins with the
+    // encapsulation frame.
+    let blob = tokio::fs::read(blob_path(&state.config.data_dir, &id)).await?;
+    let kem_len = u32::from_be_bytes(blob.get(..4).ok_or("short blob")?.try_into()?) as usize;
+    assert_eq!(kem_len, crypto::KEM_CT_LEN, "frame 0 is the encapsulation");
+
     // The admin list sees the share, and nothing about its name.
     let (status, body) = call(&mut app, authorized(get("/api/v1/shares")), Vec::new()).await?;
     assert_eq!(status, StatusCode::OK);
@@ -254,10 +289,11 @@ async fn end_to_end() -> Result<(), Box<dyn Error>> {
     assert_eq!(meta.get("one_time").and_then(Value::as_bool), Some(true));
     assert_eq!(meta.get("burned").and_then(Value::as_bool), Some(false));
 
-    // The download decrypts to exactly the plaintext.
+    // The download decrypts to exactly the plaintext, through the full
+    // post-quantum hybrid.
     let (status, body) = call(&mut app, get(&format!("/s/{id}/blob")), Vec::new()).await?;
     assert_eq!(status, StatusCode::OK);
-    let frames = decrypt_stream(&key, &body)?;
+    let frames = decrypt_stream(&sk_seed, &rnd, &body)?;
     assert_eq!(frames.len(), 3, "meta, data, marker");
     let meta_back: Value = serde_json::from_slice(frames.first().ok_or("no meta frame")?)?;
     assert_eq!(
@@ -280,8 +316,13 @@ async fn end_to_end() -> Result<(), Box<dyn Error>> {
     assert_eq!(status, StatusCode::GONE);
 
     // A multi-download share stays alive until revoked.
-    let key2 = crypto::new_key();
-    let stream2 = encrypted_stream(&key2, &meta_json("keep.txt", "text/plain", 5), b"again")?;
+    let (sk2, rnd2) = crypto::new_share_seeds();
+    let stream2 = encrypted_stream(
+        &sk2,
+        &rnd2,
+        &meta_json("keep.txt", "text/plain", 5),
+        b"again",
+    )?;
     let (status, body) = call(
         &mut app,
         authorized(post("/api/v1/shares").header("x-sfs-ttl-days", "9999")),
@@ -318,6 +359,11 @@ async fn end_to_end() -> Result<(), Box<dyn Error>> {
         status_of(&mut app, &format!("/s/{id2}/meta")).await?,
         StatusCode::NOT_FOUND
     );
+    // Revocation removed the blob with the row.
+    assert!(
+        !tokio::fs::try_exists(blob_path(&state.config.data_dir, &id2)).await?,
+        "revoked share left no blob behind"
+    );
 
     // Unknown ids are a 404, not a 410: nobody should learn that a link
     // they never had used to exist.
@@ -332,8 +378,8 @@ async fn end_to_end() -> Result<(), Box<dyn Error>> {
 
     // An expired share answers 410 until the sweeper removes it.
     sqlx::query(
-        "INSERT INTO shares (id, stored_size, chunk_count, one_time, expires_at) \
-         VALUES ('expired-test-id', 0, 0, false, now() - interval '1 hour')",
+        "INSERT INTO shares (id, stored_size, one_time, expires_at) \
+         VALUES ('expired-test-id', 0, false, now() - interval '1 hour')",
     )
     .execute(&state.pool)
     .await?;
@@ -342,14 +388,17 @@ async fn end_to_end() -> Result<(), Box<dyn Error>> {
         StatusCode::GONE
     );
 
+    let _ = tokio::fs::remove_dir_all(&state.config.data_dir).await;
     Ok(())
 }
 
 /// URL import: a tiny upstream server, a fetch, a decrypt — proving the
-/// server-side path produces the same stream format the browser does.
+/// server-side path produces the same hybrid stream format the browser
+/// does, including the unlock material in the returned link.
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn url_import() -> Result<(), Box<dyn Error>> {
-    let Some((_, mut app)) = setup().await? else {
+    let Some((state, mut app)) = setup().await? else {
         return Ok(());
     };
 
@@ -405,12 +454,14 @@ async fn url_import() -> Result<(), Box<dyn Error>> {
         .to_owned();
     let (_, key_part) = link
         .split_once("#key=")
-        .ok_or("import link has no key fragment")?;
-    let key_bytes = crypto::decode_b64_url(key_part)?;
-    let key: [u8; crypto::KEY_LEN] = key_bytes
-        .as_slice()
+        .ok_or("import link has no unlock fragment")?;
+    let unlock = crypto::decode_b64_url(key_part)?;
+    let unlock: [u8; crypto::FRAGMENT_LEN] = unlock
         .try_into()
-        .map_err(|_| "key is not 32 bytes")?;
+        .map_err(|_| "unlock material is the wrong size")?;
+    let (sk_seed, rnd) = unlock.split_at(crypto::SK_SEED_LEN);
+    let sk_seed: [u8; crypto::SK_SEED_LEN] = sk_seed.try_into().map_err(|_| "seed slice")?;
+    let rnd: [u8; crypto::RND_LEN] = rnd.try_into().map_err(|_| "rnd slice")?;
     let id = imported
         .get("id")
         .and_then(Value::as_str)
@@ -419,7 +470,7 @@ async fn url_import() -> Result<(), Box<dyn Error>> {
 
     let (status, body) = call(&mut app, get(&format!("/s/{id}/blob")), Vec::new()).await?;
     assert_eq!(status, StatusCode::OK);
-    let frames = decrypt_stream(&key, &body)?;
+    let frames = decrypt_stream(&sk_seed, &rnd, &body)?;
     assert_eq!(frames.len(), 3, "meta, data, marker");
     let meta: Value = serde_json::from_slice(frames.first().ok_or("no meta")?)?;
     assert_eq!(
@@ -450,13 +501,14 @@ async fn url_import() -> Result<(), Box<dyn Error>> {
     )
     .await?;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let _ = tokio::fs::remove_dir_all(&state.config.data_dir).await;
     Ok(())
 }
 
 /// The admin token is compared in constant time and rejects quietly.
 #[tokio::test]
 async fn wrong_tokens_get_no_details() -> Result<(), Box<dyn Error>> {
-    let Some((_, mut app)) = setup().await? else {
+    let Some((state, mut app)) = setup().await? else {
         return Ok(());
     };
     for token in ["", "nope", "test-admin-token-0123456789abcdeX"] {
@@ -482,26 +534,36 @@ async fn wrong_tokens_get_no_details() -> Result<(), Box<dyn Error>> {
     )
     .await?;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let _ = tokio::fs::remove_dir_all(&state.config.data_dir).await;
     Ok(())
 }
 
 /// The oversize guard: a share past the configured cap is refused before
-/// any of its bytes reach the database.
+/// any of its bytes reach the volume.
 #[tokio::test]
 async fn oversize_is_refused() -> Result<(), Box<dyn Error>> {
-    let Some((_, mut app)) = setup().await? else {
+    let Some((state, mut app)) = setup().await? else {
         return Ok(());
     };
     // The cap in this test's config is 1 MB; one data frame of a million
-    // bytes plus the metadata frame crosses it while the frame itself is
-    // still legal (the per-frame limit is 4 MiB).
-    let key = crypto::new_key();
+    // bytes plus the encapsulation and metadata frames crosses it while
+    // every frame is still individually legal (the per-frame limit is
+    // 4 MiB).
+    let (sk_seed, rnd) = crypto::new_share_seeds();
     let stream = encrypted_stream(
-        &key,
+        &sk_seed,
+        &rnd,
         &meta_json("big.bin", "application/octet-stream", 1_000_000),
         &vec![0_u8; 1_000_000],
     )?;
     let (status, _) = call(&mut app, authorized(post("/api/v1/shares")), stream).await?;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    // Refusal means refusal: no blob file was left behind.
+    let mut listing = tokio::fs::read_dir(&state.config.data_dir).await?;
+    assert!(
+        listing.next_entry().await?.is_none(),
+        "a refused upload left a file behind"
+    );
+    let _ = tokio::fs::remove_dir_all(&state.config.data_dir).await;
     Ok(())
 }

@@ -66,14 +66,16 @@ LABEL org.opencontainers.image.title="secure-file-share" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${COMMIT}"
 
-# Unprivileged, and nothing in the image is writable: every byte this
-# service keeps lives in Postgres, which is the point of the whole design.
+# Unprivileged. The image itself stays read-only; the one writable path is
+# the volume mounted at SFS_DATA_DIR, where the ciphertext blobs live.
+# Postgres holds the bookkeeping, the volume holds the bytes.
 USER 65532:65532
 
 # 8080 serves the public; 9090 is the metrics listener and nothing outside
 # the cluster routes to it.
 EXPOSE 8080 9090
 ENV SFS_LISTEN_ADDR=0.0.0.0:8080 \
-    SFS_METRICS_ADDR=0.0.0.0:9090
+    SFS_METRICS_ADDR=0.0.0.0:9090 \
+    SFS_DATA_DIR=/var/lib/secure-file-share
 
 ENTRYPOINT ["/secure-file-share"]

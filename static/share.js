@@ -1,9 +1,20 @@
-/* Share retrieval: the ciphertext streams down, this page decrypts it with
-   the key from the URL fragment — which the browser never sends to the
-   server — and assembles the file locally. */
+/* Share retrieval: the ciphertext streams down, this page regenerates the
+   ML-KEM keypair from the seed in the URL fragment (which the browser
+   never sends to the server), decapsulates, derives the hybrid file key
+   and assembles the file locally.
+
+   The unlock material is 96 bytes in the fragment: a 64-byte ML-KEM-1024
+   keygen seed and a 32-byte random value. An attacker holding the
+   ciphertext but not the fragment must break both ML-KEM-1024 and the
+   256-bit random value. */
 
 "use strict";
 
+const KEM_CT_LEN = 1568; // ML-KEM-1024 ciphertext, FIPS 203 Table 3
+const SK_SEED_LEN = 64; // ML-KEM-1024 keygen seed (d || z)
+const RND_LEN = 32; // the hybrid's random value
+const HKDF_SALT = "secure-file-share/v2";
+const HKDF_INFO = "file key";
 const decoder = new TextDecoder();
 
 function $(id) {
@@ -41,7 +52,9 @@ function humanSize(bytes) {
   return value.toFixed(value >= 10 ? 0 : 1) + " " + units[unit];
 }
 
-function keyFromFragment() {
+/* The fragment: 96 base64url bytes, or the link is not a complete share
+   link. Returns {skSeed, rnd} or null. */
+function unlockFromFragment() {
   const hash = location.hash;
   if (!hash.startsWith("#key=")) {
     return null;
@@ -53,14 +66,37 @@ function keyFromFragment() {
     .padEnd(encoded.length + ((4 - (encoded.length % 4)) % 4), "=");
   try {
     const binary = atob(normalized);
+    if (binary.length !== SK_SEED_LEN + RND_LEN) {
+      return null;
+    }
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i += 1) {
       bytes[i] = binary.charCodeAt(i);
     }
-    return bytes.length === 32 ? bytes : null;
+    return {
+      skSeed: bytes.subarray(0, SK_SEED_LEN),
+      rnd: bytes.subarray(SK_SEED_LEN),
+    };
   } catch {
     return null;
   }
+}
+
+/* The hybrid file key: HKDF-SHA256 over the decapsulated secret and the
+   random value. Both must break for the key to fall. */
+function deriveFileKey(sharedSecret, rnd) {
+  const ikm = new Uint8Array(sharedSecret.length + rnd.length);
+  ikm.set(sharedSecret, 0);
+  ikm.set(rnd, sharedSecret.length);
+  return new Uint8Array(
+    SFS_PQ.hkdf(
+      SFS_PQ.sha256,
+      ikm,
+      new TextEncoder().encode(HKDF_SALT),
+      new TextEncoder().encode(HKDF_INFO),
+      32,
+    ),
+  );
 }
 
 /* Reads exactly n bytes from the response stream, holding at most the
@@ -91,7 +127,7 @@ function makeTaker(response) {
         } else {
           out.set(head.subarray(0, need), filled);
           queue[0] = head.subarray(need);
-          filled = need;
+          filled += need;
         }
       }
       queued -= n;
@@ -114,15 +150,7 @@ async function fetchMeta(id) {
   return response.json();
 }
 
-async function download(id, keyBytes) {
-  const cryptoKey = await crypto.subtle.importKey(
-    "raw",
-    keyBytes,
-    "AES-GCM",
-    false,
-    ["decrypt"],
-  );
-
+async function download(id, unlock) {
   const response = await fetch("/s/" + id + "/blob");
   if (response.status === 404) {
     throw new Error("This share does not exist.");
@@ -136,8 +164,35 @@ async function download(id, keyBytes) {
 
   const total = Number(response.headers.get("Content-Length") || 0);
   const take = makeTaker(response);
+
+  // Frame 0 is the ML-KEM-1024 ciphertext, raw bytes. The keypair comes
+  // back from the seed, the shared secret from the ciphertext, and only
+  // then does anything decrypt.
+  const prefix = await take.take(4);
+  if (prefix === null) {
+    throw new Error("the stream is malformed");
+  }
+  const kemLen =
+    (prefix[0] << 24) | (prefix[1] << 16) | (prefix[2] << 8) | prefix[3];
+  if (kemLen !== KEM_CT_LEN) {
+    throw new Error("the stream is malformed: no encapsulation frame");
+  }
+  const kemCt = await take.take(kemLen);
+  if (kemCt === null) {
+    throw new Error("the stream ended early");
+  }
+  const { secretKey } = SFS_PQ.ml_kem1024.keygen(unlock.skSeed);
+  const sharedSecret = SFS_PQ.ml_kem1024.decapsulate(kemCt, secretKey);
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw",
+    deriveFileKey(sharedSecret, unlock.rnd),
+    "AES-GCM",
+    false,
+    ["decrypt"],
+  );
+
   const parts = [];
-  let received = 0;
+  let received = 4 + kemLen;
   let meta = null;
 
   for (;;) {
@@ -167,11 +222,11 @@ async function download(id, keyBytes) {
       );
     } catch {
       throw new Error(
-        "Decryption failed: wrong key, or the share was corrupted.",
+        "Decryption failed: wrong unlock material, or the share was corrupted.",
       );
     }
     if (meta === null) {
-      // Frame 0 carries the encrypted metadata: name, MIME type, size.
+      // Frame 1 carries the encrypted metadata: name, MIME type, size.
       try {
         meta = JSON.parse(decoder.decode(plain));
       } catch {
@@ -207,16 +262,16 @@ async function download(id, keyBytes) {
 
 async function init() {
   const id = location.pathname.split("/").pop();
-  const keyBytes = keyFromFragment();
+  const unlock = unlockFromFragment();
 
   if (!id) {
     showError("No share id in the address.");
     return;
   }
-  if (keyBytes === null) {
+  if (unlock === null) {
     showError(
-      "This link has no key in it. Ask for the complete link \u2014 the " +
-        "part after # is what unlocks the file.",
+      "This link is missing its unlock material. Ask for the complete " +
+        "link \u2014 the part after # is what unlocks the file.",
     );
     return;
   }
@@ -242,7 +297,7 @@ async function init() {
     const button = event.target;
     button.disabled = true;
     try {
-      const file = await download(id, keyBytes);
+      const file = await download(id, unlock);
       $("state-text").textContent = "Downloaded.";
       $("state-detail").textContent =
         'Saved as "' + file.name + '". If the name looks right, the ' +

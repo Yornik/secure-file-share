@@ -148,12 +148,15 @@ pub async fn import_share(
         log::error!("metadata serialization failed: {error}");
         AppError::Internal("meta".into())
     })?;
-    let key = crypto::new_key();
+    let (sk_seed, rnd) = crypto::new_share_seeds();
+    let (kem_ct, file_key) = crypto::kem_encapsulate(&sk_seed, &rnd);
 
-    let (mut writer, id, expires_at) = ShareWriter::begin(&state.pool, one_time, ttl_days).await?;
+    let (mut writer, id, expires_at) =
+        ShareWriter::begin(&state.pool, &state.config.data_dir, one_time, ttl_days).await?;
     let imported = encrypt_stream(
         &mut writer,
-        &key,
+        &kem_ct,
+        &file_key,
         &meta_bytes,
         response,
         state.config.import_max_bytes,
@@ -165,11 +168,17 @@ pub async fn import_share(
     }
     writer.finish().await?;
     Metrics::incr(&state.metrics.imports_ok);
+    // The unlock material: the ML-KEM seed regenerates the keypair, the
+    // random value carries the other half of the hybrid. Never logged,
+    // never stored anywhere but the response.
+    let mut unlock = Vec::with_capacity(crypto::FRAGMENT_LEN);
+    unlock.extend_from_slice(&sk_seed);
+    unlock.extend_from_slice(&rnd);
     let link = format!(
         "{}/s/{}#key={}",
         state.config.base_url,
         id,
-        crypto::encode_b64_url(&key)
+        crypto::encode_b64_url(&unlock)
     );
     log::info!("imported share {id} from {url}");
     Ok(Json(ImportResponse {
@@ -180,16 +189,19 @@ pub async fn import_share(
 }
 
 /// Stream the upstream body through the encryptor, frame by frame, so the
-/// process holds at most one 4 MiB chunk of plaintext at a time. The cap is
-/// counted on plaintext bytes, before encryption, exactly like the browser
-/// path counts ciphertext.
+/// process holds at most one 4 MiB chunk of plaintext at a time. Frame 0 is
+/// the encapsulation, handed through untouched; frame 1 is the metadata;
+/// the cap is counted on plaintext bytes, before encryption, exactly like
+/// the browser path counts ciphertext.
 async fn encrypt_stream(
     writer: &mut ShareWriter<'_>,
+    kem_ct: &[u8; crypto::KEM_CT_LEN],
     key: &[u8; crypto::KEY_LEN],
     meta: &[u8],
     response: reqwest::Response,
     cap: u64,
 ) -> Result<(), AppError> {
+    writer.add_frame(kem_ct.to_vec()).await?;
     let nonce = crypto::new_nonce();
     let frame = crypto::encrypt_chunk(key, &nonce, meta)
         .map_err(|_| AppError::Internal("encrypt".into()))?;

@@ -13,16 +13,16 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use bytes::BytesMut;
-use futures::{Stream, StreamExt, stream};
+use bytes::Bytes;
+use futures::stream;
 use rust_embed::RustEmbed;
 use serde::Serialize;
-use sqlx::{Row, postgres::PgRow};
+use sqlx::Row;
 use subtle::ConstantTimeEq;
 
 use crate::{
     error::AppError,
-    frame::{FrameReader, put_frame},
+    frame::FrameReader,
     state::{AppState, Metrics, ShareWriter, clamp_ttl},
 };
 
@@ -178,8 +178,8 @@ pub async fn list_shares(
 }
 
 /// Browser-encrypted upload. The body is the frame stream the JavaScript in
-/// `static/app.js` built; this handler never touches a key, it only splits
-/// the stream into rows and counts bytes.
+/// `static/app.js` built; this handler never touches a key, it only checks
+/// frame shapes, writes the blob to the volume and keeps the bookkeeping.
 pub async fn create_share(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -190,14 +190,15 @@ pub async fn create_share(
     let ttl_days = parse_ttl(&headers, &state);
     let stream = request.into_body().into_data_stream();
     let mut reader = FrameReader::new(stream, state.config.max_upload_bytes);
-    let (mut writer, _id, expires_at) = ShareWriter::begin(&state.pool, one_time, ttl_days).await?;
+    let (mut writer, _id, expires_at) =
+        ShareWriter::begin(&state.pool, &state.config.data_dir, one_time, ttl_days).await?;
     while let Some(frame) = reader.next_frame().await? {
         writer.add_frame(frame).await?;
     }
     let stored = writer.finish().await?;
     Metrics::incr(&state.metrics.shares_created);
     log::info!(
-        "stored share {id}: {frames} frames, {stored} bytes (browser-encrypted)",
+        "stored share {id}: {frames} frames, {stored} bytes on the volume (browser-encrypted)",
         id = stored.id,
         frames = stored.frames,
         stored = stored.stored
@@ -221,7 +222,13 @@ pub async fn revoke_share(
     if result.rows_affected() == 0 {
         Err(AppError::NotFound)
     } else {
-        // The chunks go with the row: ON DELETE CASCADE.
+        // The row is gone, so nothing points at the blob anymore; remove it
+        // best-effort and let the sweeper catch any miss.
+        if let Err(error) =
+            tokio::fs::remove_file(crate::state::blob_path(&state.config.data_dir, &id)).await
+        {
+            log::warn!("blob for revoked share {id} did not remove: {error}");
+        }
         Ok(StatusCode::NO_CONTENT)
     }
 }
@@ -259,18 +266,19 @@ pub async fn share_meta(
     }))
 }
 
-/// State carried through the download stream. Frames only: the burn does
-/// not happen here. A one-time share is claimed by the UPDATE below and
-/// its row stays as a tombstone, so the next opener reads 410 ("burned")
-/// instead of 404 ("never existed"); the sweeper reclaims the chunks
-/// within the hour.
+/// State carried through the download stream: the blob file and one read
+/// buffer. The file is streamed in 64 KiB pieces, so a 2 GiB share crosses
+/// the network with a few dozen kilobytes of memory, never whole.
 struct BlobState {
-    rows: std::pin::Pin<Box<dyn Stream<Item = Result<PgRow, sqlx::Error>> + Send>>,
+    file: tokio::fs::File,
+    buf: Vec<u8>,
 }
 
 /// Public ciphertext download. The claim is one statement: `downloads` is
 /// bumped in the same UPDATE that decides eligibility, so two racing
-/// downloads of a burn-after-reading share cannot both win.
+/// downloads of a burn-after-reading share cannot both win. The blob is
+/// already a file on the volume; this handler adds framing to nothing —
+/// the file on disk is byte-identical to the wire format.
 #[allow(clippy::too_many_lines)]
 pub async fn share_blob(
     State(state): State<AppState>,
@@ -302,31 +310,33 @@ pub async fn share_blob(
     Metrics::incr(&state.metrics.downloads);
     let stored_size = claimed.get::<i64, _>("stored_size");
 
-    let rows = sqlx::query("SELECT data FROM share_chunks WHERE share_id = $1 ORDER BY seq")
-        .bind(&id)
-        .fetch(&state.pool);
+    let file = tokio::fs::File::open(crate::state::blob_path(&state.config.data_dir, &id))
+        .await
+        .map_err(|error| {
+            // The row exists and is live, so a missing file means the
+            // volume lost a blob the bookkeeping still promises. That is
+            // worth saying loudly, not answering 404 with.
+            log::error!("blob file for {id} vanished: {error}");
+            AppError::Internal("blob file".into())
+        })?;
     let body = Body::from_stream(stream::unfold(
         BlobState {
-            rows: Box::pin(rows),
+            file,
+            buf: vec![0_u8; 64 * 1024],
         },
         |mut st| async move {
-            match st.rows.next().await {
-                Some(Ok(row)) => match row.try_get::<Vec<u8>, _>("data") {
-                    Ok(data) => {
-                        let mut frame = BytesMut::with_capacity(4 + data.len());
-                        put_frame(&mut frame, &data);
-                        Some((Ok(frame.freeze()), st))
-                    }
-                    Err(error) => {
-                        log::error!("chunk read failed: {error}");
-                        Some((Err(io::Error::other(error)), st))
-                    }
-                },
-                Some(Err(error)) => {
-                    log::error!("chunk stream failed: {error}");
+            match tokio::io::AsyncReadExt::read(&mut st.file, &mut st.buf).await {
+                Ok(0) => None,
+                Ok(read) => Some((
+                    Ok(Bytes::copy_from_slice(
+                        st.buf.get(..read).unwrap_or_default(),
+                    )),
+                    st,
+                )),
+                Err(error) => {
+                    log::error!("blob stream failed: {error}");
                     Some((Err(io::Error::other(error)), st))
                 }
-                None => None,
             }
         },
     ));

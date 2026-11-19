@@ -12,6 +12,10 @@ pub struct Config {
     pub listen_addr: SocketAddr,
     pub metrics_addr: SocketAddr,
     pub database_url: String,
+    /// Directory on a persistent volume where ciphertext blobs live: one
+    /// `<id>.sfs` file per share. The database holds only bookkeeping, so
+    /// the blob ceiling is the volume, not what is healthy for a database.
+    pub data_dir: String,
     pub admin_token: String,
     pub base_url: String,
     /// Hard ceiling on stored ciphertext per share, browser upload and URL
@@ -53,6 +57,7 @@ impl Config {
             &mut errors,
         );
         let database_url = required("DATABASE_URL", &mut errors);
+        let data_dir = optional("SFS_DATA_DIR", "/var/lib/secure-file-share");
         let admin_token = required("SFS_ADMIN_TOKEN", &mut errors);
         if let Some(token) = admin_token.as_deref()
             && token.len() < 16
@@ -69,16 +74,20 @@ impl Config {
             errors.push("SFS_BASE_URL must start with http:// or https:// (it is used to build share links)".to_owned());
         }
 
+        // 2 GiB, not 512 MiB: the blobs live on a volume now, so the ceiling
+        // is what the volume and the browser can carry, not what a database
+        // row should be asked to hold. An operator raises or lowers it on
+        // purpose.
         let max_upload_bytes = parse_u64(
             env::var("SFS_MAX_UPLOAD_BYTES"),
             "SFS_MAX_UPLOAD_BYTES",
-            512 * 1024 * 1024,
+            2 * 1024 * 1024 * 1024,
             &mut errors,
         );
         let import_max_bytes = parse_u64(
             env::var("SFS_IMPORT_MAX_BYTES"),
             "SFS_IMPORT_MAX_BYTES",
-            512 * 1024 * 1024,
+            2 * 1024 * 1024 * 1024,
             &mut errors,
         );
         let default_ttl_days = parse_u64(
@@ -113,6 +122,7 @@ impl Config {
             listen_addr,
             metrics_addr,
             database_url,
+            data_dir,
             admin_token,
             base_url,
             max_upload_bytes,
@@ -125,6 +135,7 @@ impl Config {
                 Some(listen_addr),
                 Some(metrics_addr),
                 Some(database_url),
+                data_dir,
                 Some(admin_token),
                 Some(base_url),
                 Some(max_upload_bytes),
@@ -136,6 +147,7 @@ impl Config {
                 listen_addr,
                 metrics_addr,
                 database_url,
+                data_dir,
                 admin_token,
                 base_url: base_url.trim_end_matches('/').to_owned(),
                 max_upload_bytes,
@@ -156,6 +168,14 @@ fn required(name: &str, errors: &mut Vec<String>) -> Option<String> {
             errors.push(format!("{name} is required"));
             None
         }
+    }
+}
+
+/// A variable with a default: empty means the default, not an error.
+fn optional(name: &str, default: &str) -> String {
+    match env::var(name) {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => default.to_owned(),
     }
 }
 

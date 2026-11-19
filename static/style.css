@@ -154,6 +154,11 @@ button:disabled { opacity: 0.5; cursor: default; }
 
 /* Result and error blocks. */
 
+/* One override so the `hidden` attribute always wins: `.result` and friends
+   set display below, and an author display rule would otherwise beat the
+   browser's [hidden] default and show the boxes before their time. */
+[hidden] { display: none !important; }
+
 .result { display: grid; gap: 0.5rem; }
 
 .link-row { display: flex; gap: 0.5rem; }

@@ -45,6 +45,21 @@ async fn main() {
     }
     log::info!("database ready, schema current");
 
+    // The volume directory: create it, then prove it is writable before
+    // anything can half-work. A read-only volume is a startup error, not a
+    // first-upload surprise.
+    if let Err(error) = tokio::fs::create_dir_all(&config.data_dir).await {
+        log::error!("cannot create {}: {error}", config.data_dir);
+        exit(1);
+    }
+    let probe = std::path::Path::new(&config.data_dir).join(".write-probe");
+    if let Err(error) = tokio::fs::write(&probe, b"probe").await {
+        log::error!("cannot write in {}: {error}", config.data_dir);
+        exit(1);
+    }
+    let _ = tokio::fs::remove_file(&probe).await;
+    log::info!("blob directory ready: {}", config.data_dir);
+
     // One shared client for URL imports: connection pooling, a redirect
     // cap, and one place where a future timeout policy would live.
     let http = match reqwest::Client::builder()
@@ -66,7 +81,11 @@ async fn main() {
         http,
     };
 
-    tokio::spawn(sweep::run(pool.clone(), config.sweep_interval));
+    tokio::spawn(sweep::run(
+        pool.clone(),
+        config.data_dir.clone(),
+        config.sweep_interval,
+    ));
 
     // Metrics on their own listener, on purpose: the main port faces the
     // internet, and this build_info names the commit behind the running

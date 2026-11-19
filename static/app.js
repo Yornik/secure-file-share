@@ -1,11 +1,20 @@
-/* Share creation: pick a file (or a URL), the browser encrypts, the
-   ciphertext goes up, the page builds the link with the key in the
-   fragment. No frameworks, no CDN, CSP-clean. */
+/* Share creation: pick a file (or a URL), the browser encrypts with a
+   hybrid post-quantum key (ML-KEM-1024 encapsulation + AES-256-GCM), the
+   ciphertext goes up, the page builds the link with the unlock material
+   in the fragment. No frameworks, no CDN, CSP-clean.
+
+   The unlock material never leaves this page except inside the link's
+   #fragment, which browsers do not send to any server. */
 
 "use strict";
 
 const CHUNK = 4 * 1024 * 1024; // 4 MiB, matches the server's frame limit
 const META_LIMIT = 64 * 1024;
+const KEM_CT_LEN = 1568; // ML-KEM-1024 ciphertext, FIPS 203 Table 3
+const SK_SEED_LEN = 64; // ML-KEM-1024 keygen seed (d || z)
+const RND_LEN = 32; // the hybrid's random value
+const HKDF_SALT = "secure-file-share/v2";
+const HKDF_INFO = "file key";
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
@@ -25,13 +34,24 @@ function b64url(bytes) {
   return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
 }
 
-function randomKey() {
-  const key = new Uint8Array(32);
-  crypto.getRandomValues(key);
-  return key;
+/* The hybrid file key: HKDF-SHA256 over the encapsulated secret and the
+   random value. Both must break for the key to fall. */
+function deriveFileKey(sharedSecret, rnd) {
+  const ikm = new Uint8Array(sharedSecret.length + rnd.length);
+  ikm.set(sharedSecret, 0);
+  ikm.set(rnd, sharedSecret.length);
+  return new Uint8Array(
+    SFS_PQ.hkdf(
+      SFS_PQ.sha256,
+      ikm,
+      encoder.encode(HKDF_SALT),
+      encoder.encode(HKDF_INFO),
+      32,
+    ),
+  );
 }
 
-async function importKey(raw) {
+async function importAesKey(raw) {
   return crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt"]);
 }
 
@@ -62,10 +82,25 @@ function showProgress(label, fraction) {
 }
 
 /* The encrypted stream, in the format the server parses:
-   [metadata frame][data frames...] [empty end marker], every frame
-   prefixed by its u32 big-endian length. */
-async function buildFrames(file, key, onProgress) {
-  const cryptoKey = await importKey(key);
+   [KEM ciphertext frame][metadata frame][data frames...] [empty marker],
+   every frame prefixed by its u32 big-endian length. The ML-KEM seed and
+   the random value travel only in the returned unlock material. */
+async function buildFrames(file, onProgress) {
+  // The seeds: 64 bytes regenerate the same ML-KEM keypair everywhere
+  // (deterministic keygen, FIPS 203), 32 bytes carry the hybrid's random
+  // half. Together they are the unlock material for the link.
+  const skSeed = new Uint8Array(SK_SEED_LEN);
+  crypto.getRandomValues(skSeed);
+  const rnd = new Uint8Array(RND_LEN);
+  crypto.getRandomValues(rnd);
+
+  const { publicKey } = SFS_PQ.ml_kem1024.keygen(skSeed);
+  const { cipherText, sharedSecret } = SFS_PQ.ml_kem1024.encapsulate(publicKey);
+  if (cipherText.length !== KEM_CT_LEN) {
+    throw new Error("unexpected ML-KEM-1024 ciphertext size");
+  }
+  const fileKey = await importAesKey(deriveFileKey(sharedSecret, rnd));
+
   const meta = {
     // 120 code points, the same cap the server applies to URL imports;
     // the name is a display label, and both paths must agree.
@@ -77,26 +112,32 @@ async function buildFrames(file, key, onProgress) {
   if (metaPlain.length > META_LIMIT) {
     throw new Error("the file name is too long to carry");
   }
+
   const parts = [];
+  parts.push(prefixLength(cipherText), cipherText);
   let iv = crypto.getRandomValues(new Uint8Array(12));
-  const metaFrame = await encryptFrame(cryptoKey, iv, metaPlain);
+  const metaFrame = await encryptFrame(fileKey, iv, metaPlain);
   parts.push(prefixLength(metaFrame), metaFrame);
 
   for (let offset = 0; offset < file.size; offset += CHUNK) {
     const slice = file.slice(offset, Math.min(offset + CHUNK, file.size));
     const plain = await slice.arrayBuffer();
     iv = crypto.getRandomValues(new Uint8Array(12));
-    const frame = await encryptFrame(cryptoKey, iv, plain);
+    const frame = await encryptFrame(fileKey, iv, plain);
     parts.push(prefixLength(frame), frame);
     onProgress(offset / file.size);
   }
 
   // Empty end-of-stream marker: a truncated upload cannot look complete.
   iv = crypto.getRandomValues(new Uint8Array(12));
-  const marker = await encryptFrame(cryptoKey, iv, new Uint8Array(0));
+  const marker = await encryptFrame(fileKey, iv, new Uint8Array(0));
   parts.push(prefixLength(marker), marker);
   onProgress(1);
-  return parts;
+
+  const unlock = new Uint8Array(SK_SEED_LEN + RND_LEN);
+  unlock.set(skSeed, 0);
+  unlock.set(rnd, SK_SEED_LEN);
+  return { parts, unlock };
 }
 
 function finishShare(link, expiresAt) {
@@ -187,9 +228,8 @@ async function onSubmit(event) {
       showError("Choose a file, or fill in the URL field.");
       return;
     }
-    const key = randomKey();
     showProgress("Encrypting\u2026 0%", 0);
-    const parts = await buildFrames(file, key, (fraction) => {
+    const { parts, unlock } = await buildFrames(file, (fraction) => {
       showProgress("Encrypting\u2026", fraction / 2);
     });
     const created = await uploadCiphertext(parts, {
@@ -199,7 +239,7 @@ async function onSubmit(event) {
       "X-SFS-Ttl-Days": String(ttlDays),
     });
     const link =
-      location.origin + "/s/" + created.id + "#key=" + b64url(key);
+      location.origin + "/s/" + created.id + "#key=" + b64url(unlock);
     finishShare(link, created.expires_at);
   } catch (error) {
     showError(
