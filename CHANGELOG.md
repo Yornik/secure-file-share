@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.1](https://github.com/Yornik/secure-file-share/compare/v0.3.0...v0.3.1) (2026-11-19)
+
+
+### Bug Fixes
+
+* **docker:** rebuild the crate after COPY and smoke-test the binary ([61c1b15](https://github.com/Yornik/secure-file-share/commit/61c1b15d1d92c79b05529ae03b49e610510b8746))
+
+
+### Documentation
+
+* rewrite the README in ASD-STE100 style, trim screenshots, add badges ([5843c83](https://github.com/Yornik/secure-file-share/commit/5843c83d05a6535438c1de1c337ecd14253e18f8))
+
 ## [0.3.0](https://github.com/Yornik/secure-file-share/compare/v0.2.0...v0.3.0) (2026-11-19)
 
 
