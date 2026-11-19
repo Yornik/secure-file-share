@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>secure-file-share control</title>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <header>
+    <h1>secure&#8209;file&#8209;share control</h1>
+    <p class="tagline">
+      The operator door. This listener is the only place a share can be
+      deleted. It does not accept the upload token.
+    </p>
+  </header>
+
+  <main>
+    <form id="control-form">
+      <label class="field">
+        <span class="field-label">Control token</span>
+        <input type="password" id="token" autocomplete="off" spellcheck="false">
+        <span class="hint">A different secret from the upload token. Kept in this tab's memory only.</span>
+      </label>
+
+      <label class="field">
+        <span class="field-label">Share link</span>
+        <input type="text" id="link" placeholder="https://example.org/s/&lt;id&gt;#key=..." autocomplete="off" spellcheck="false">
+        <span class="hint">Paste the whole link, the path form, or just the share id. The fragment is not needed.</span>
+      </label>
+
+      <div class="row">
+        <button type="submit" id="lookup">Lookup</button>
+        <button type="button" id="delete">Delete</button>
+      </div>
+    </form>
+
+    <div id="confirm" class="warn" hidden>
+      This deletes the share, the row and the file. This cannot be undone.
+      Click Delete again to confirm.
+    </div>
+
+    <div id="error" class="error" hidden></div>
+
+    <div id="result" class="result" hidden></div>
+  </main>
+
+  <footer>
+    <p>Lookup reads the bookkeeping row. Delete removes the row and the
+    file, and writes one audit line to the server log. Nothing here
+    decrypts a file.</p>
+  </footer>
+
+  <script src="/assets/control.js"></script>
+</body>
+</html>

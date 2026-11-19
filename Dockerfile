@@ -81,9 +81,9 @@ LABEL org.opencontainers.image.title="secure-file-share" \
 # Postgres holds the bookkeeping, the volume holds the bytes.
 USER 65532:65532
 
-# 8080 serves the public; 9090 is the metrics listener and nothing outside
-# the cluster routes to it.
-EXPOSE 8080 9090
+# 8080 serves the public; 9090 is the metrics listener and 8081 the
+# control plane. Nothing outside the cluster routes to 9090 or 8081.
+EXPOSE 8080 8081 9090
 ENV SFS_LISTEN_ADDR=0.0.0.0:8080 \
     SFS_METRICS_ADDR=0.0.0.0:9090 \
     SFS_DATA_DIR=/var/lib/secure-file-share

@@ -111,6 +111,8 @@ Do this to run the service locally:
 |---|---|
 | `DATABASE_URL` | Postgres DSN. Required. |
 | `SFS_UPLOAD_TOKEN` | Bearer token for the write paths. Required, 16 characters or more. The comparison is constant-time. `SFS_ADMIN_TOKEN`, the name before v0.4, still works. |
+| `SFS_CONTROL_TOKEN` | Bearer token for the control plane. Empty by default: the control plane does not start. 16 characters or more. Use a different value from `SFS_UPLOAD_TOKEN`. |
+| `SFS_CONTROL_ADDR` | Control-plane listener. Default: `0.0.0.0:8081`. Nothing outside the cluster routes to it. |
 | `NOT_PUBLIC_FACING_TURN_OFF_UPLOAD_TOKEN` | Set to `1` for a deployment no public network can reach. The write paths accept uploads without a token. Read the red warning below before you set it. |
 | `SFS_BASE_URL` | Origin for share links. Required. |
 | `SFS_DATA_DIR` | Directory for the ciphertext blobs. Default: `/var/lib/secure-file-share`. Mount a volume here. |
@@ -150,8 +152,49 @@ GET    /s/{id}/blob          the ciphertext, streamed
 
 There is no `DELETE` on this listener, in any mode. A share dies by
 expiry or by burn, and nothing on the public side can change that. The
-operator revokes a share on the control plane, a separate listener with
-its own token.
+control plane is the only deletion path. See [Control plane](#control-plane).
+
+## Control plane
+
+The control plane is the operator door. It has its own listener and its
+own token. The public API has no deletion path in any mode. The control
+plane is the only one.
+
+The control token is a different secret from the upload token. A leaked
+upload token cannot delete a share. The two doors stay separate on
+purpose.
+
+Nothing outside the cluster routes to the control port. Reach it with a
+port-forward.
+
+Do this to delete a share:
+
+1. Open a port-forward: `kubectl port-forward deploy/secure-file-share 8081:8081`.
+2. Open `http://localhost:8081` in a browser.
+3. Paste the control token and the share link into the page.
+4. Press Lookup, then Delete.
+
+Paste the full share link, the path form (`/s/<id>`), or the bare share
+id. The fragment is not part of the id. The server never sees the
+fragment anyway.
+
+The lookup answers the bookkeeping row: id, stored size, downloads,
+created time and expiry time. The delete removes the row and the blob
+file. The delete answers the deleted bookkeeping, so the response and
+the log tell the same story.
+
+Every deletion writes one audit line to the server log: the id, the
+stored size and the timestamps. Keep the log with the compliance
+records.
+
+The page loads without the token. A browser navigation cannot attach a
+bearer header, so the page is open and the token travels with each
+request the page sends. The lookup and the delete behind it still need
+the token.
+
+Scripts can call the same two routes directly. Send
+`Authorization: Bearer ***` and `{"link": "..."}` to
+`http://localhost:8081/lookup` and `http://localhost:8081/delete`.
 
 ### Metrics
 

@@ -54,6 +54,13 @@ Operational assumptions:
 > cannot read what is stored. It is a crime in many countries to host
 > such content. Keep the switch off unless the network is private beyond
 > doubt. Keep the control token set, so revocation stays possible.
+- The control plane carries the control token, separate from the upload
+  token on purpose: the door that deletes is not the door that uploads,
+  and a leaked upload token still cannot delete a share. Nothing outside
+  the cluster routes to the control listener; an operator reaches it
+  with a port-forward. Every deletion writes one audit line (id, size,
+  timestamps) to the log, so the compliance record exists outside the
+  database too.
 - The database is trusted with bookkeeping and the volume with ciphertext.
   Expiry and burn-after-reading are enforced at claim time in the same
   statement that counts the download, so races cannot double-spend a

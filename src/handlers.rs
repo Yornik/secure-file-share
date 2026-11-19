@@ -139,7 +139,10 @@ pub async fn asset(Path(path): Path<String>) -> Result<Response, AppError> {
     serve_asset(&path)
 }
 
-fn serve_asset(name: &str) -> Result<Response, AppError> {
+/// Serves one file from the embedded folder by name. `pub(crate)`
+/// because the control plane's index is the same kind of answer: one
+/// embedder, two listeners.
+pub(crate) fn serve_asset(name: &str) -> Result<Response, AppError> {
     let asset = Assets::get(name).ok_or(AppError::NotFound)?;
     let mime = mime_guess::from_path(name)
         .first_raw()
