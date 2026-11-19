@@ -36,7 +36,11 @@ pub fn app(state: AppState) -> Router {
 /// Headers on every response. The CSP has no 'unsafe-inline' and the UI is
 /// written to live under it: scripts and styles are separate same-origin
 /// files, no inline event handlers, no inline style attributes.
-async fn security_headers(request: Request, next: Next) -> Response {
+///
+/// `pub(crate)` because the control router reuses it: one header policy
+/// for both doors, so the control plane cannot drift from the public
+/// one as they evolve.
+pub(crate) async fn security_headers(request: Request, next: Next) -> Response {
     let path = request.uri().path().to_owned();
     let mut response = next.run(request).await;
     let headers = response.headers_mut();

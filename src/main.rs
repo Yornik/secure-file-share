@@ -1,17 +1,23 @@
-//! Startup: read the environment, connect, migrate, start the two
+//! Startup: read the environment, connect, migrate, start the
 //! listeners. Anything misconfigured stops here with one log line per
-//! problem, not mid-flight with a mystery.
+//! problem, not mid-flight with a mystery. The web port and the metrics
+//! port always run; the control plane runs only when its token exists.
 
 use std::{process::exit, sync::Arc, time::Duration};
 
 use secure_file_share::{
     config::Config,
-    import, metrics, router,
+    control, import, metrics, router,
     state::{AppState, Metrics},
     sweep,
 };
 
+// Startup reads as one block on purpose: an operator debugging a pod
+// follows the sequence top to bottom — config, database, volume,
+// listeners — in the order the log lines will appear. Splitting it
+// into helpers would scatter that one glance across four functions.
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -99,6 +105,33 @@ async fn main() {
         Err(error) => {
             log::error!("cannot bind {}: {error}", config.metrics_addr);
             exit(1);
+        }
+    }
+
+    // The control plane: the only door that deletes a share, so it never
+    // rides the public listener. Its own port, its own token, and nothing
+    // outside the cluster routes to it — an operator reaches it with a
+    // port-forward. No token configured, no door.
+    if config.control_token.is_empty() {
+        // One info line, not a warning: leaving the control plane off is
+        // a valid deployment; the operator who wants the door sets the
+        // token and it starts.
+        log::info!("control plane disabled: SFS_CONTROL_TOKEN is not set");
+    } else {
+        match tokio::net::TcpListener::bind(config.control_addr).await {
+            Ok(listener) => {
+                let router = control::control_router(state.clone());
+                tokio::spawn(async move {
+                    if let Err(error) = axum::serve(listener, router).await {
+                        log::error!("control listener failed: {error}");
+                    }
+                });
+                log::info!("control plane listening on {}", config.control_addr);
+            }
+            Err(error) => {
+                log::error!("cannot bind {}: {}", config.control_addr, error);
+                exit(1);
+            }
         }
     }
 

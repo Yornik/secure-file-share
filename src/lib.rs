@@ -4,6 +4,7 @@
 //! this process), MIT-licensed.
 
 pub mod config;
+pub mod control;
 pub mod crypto;
 pub mod error;
 pub mod frame;

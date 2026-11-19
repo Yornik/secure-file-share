@@ -24,13 +24,14 @@ use tower::ServiceExt;
 
 use secure_file_share::{
     config::Config,
-    crypto,
+    control, crypto,
     frame::put_frame,
     import, metrics, router,
     state::{AppState, Metrics, blob_path},
 };
 
 const ADMIN_TOKEN: &str = "test-admin-token-0123456789abcdef";
+const CONTROL_TOKEN: &str = "test-control-token-0123456789";
 const BASE_URL: &str = "http://test.local";
 
 /// A complete state wired to the test database and a throwaway blob
@@ -51,6 +52,23 @@ async fn setup_with(
     not_public: bool,
     allow_private: bool,
 ) -> Result<Option<(AppState, Router)>, Box<dyn Error>> {
+    let Some(state) = setup_state(not_public, allow_private, String::new()).await? else {
+        return Ok(None);
+    };
+    let app = router::app(state.clone());
+    Ok(Some((state, app)))
+}
+
+/// The state on its own, so a test can wire it to whichever routers it
+/// needs: the control-plane test binds one state to both the public
+/// app and the control app. `control_token` seeds the control plane's
+/// bearer; every other test passes an empty one, which starts no
+/// control plane.
+async fn setup_state(
+    not_public: bool,
+    allow_private: bool,
+    control_token: String,
+) -> Result<Option<AppState>, Box<dyn Error>> {
     let Ok(database_url) = std::env::var("SFS_TEST_DATABASE_URL") else {
         log::warn!("SFS_TEST_DATABASE_URL is not set; skipping integration tests");
         return Ok(None);
@@ -82,9 +100,7 @@ async fn setup_with(
             ADMIN_TOKEN.to_owned()
         },
         not_public_facing_turn_off_upload_token: not_public,
-        // The control plane gets its own coverage in the control-plane
-        // tests; the plain data-plane state does not start one.
-        control_token: String::new(),
+        control_token,
         control_addr: "127.0.0.1:18081".parse()?,
         import_allow_private_urls: allow_private,
         base_url: BASE_URL.to_owned(),
@@ -102,8 +118,7 @@ async fn setup_with(
         // exercise the same wiring a deployment gets.
         http: import::http_client(allow_private),
     };
-    let app = router::app(state.clone());
-    Ok(Some((state, app)))
+    Ok(Some(state))
 }
 
 async fn call(
@@ -137,6 +152,11 @@ fn delete(path: &str) -> Builder {
 
 fn authorized(mut builder: Builder) -> Builder {
     builder = builder.header(header::AUTHORIZATION, format!("Bearer {ADMIN_TOKEN}"));
+    builder
+}
+
+fn control_authorized(mut builder: Builder) -> Builder {
+    builder = builder.header(header::AUTHORIZATION, format!("Bearer {CONTROL_TOKEN}"));
     builder
 }
 
@@ -811,6 +831,231 @@ async fn not_public_mode_opens_uploads_only() -> Result<(), Box<dyn Error>> {
         status_of(&mut app, &format!("/s/{id}/meta")).await?,
         StatusCode::OK
     );
+    let _ = tokio::fs::remove_dir_all(&state.config.data_dir).await;
+    Ok(())
+}
+
+/// The control plane deletes by share link, on its own router, with its
+/// own token: the page loads without one (a browser cannot attach a
+/// header), the API behind it answers nothing without it, the lookup
+/// reads the bookkeeping, the delete removes the row and the blob
+/// together, and the two doors never accept each other's tokens.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn control_plane_deletes_by_link() -> Result<(), Box<dyn Error>> {
+    let Some(state) = setup_state(false, true, CONTROL_TOKEN.to_owned()).await? else {
+        return Ok(());
+    };
+    let mut app = router::app(state.clone());
+    let mut control = control::control_router(state.clone());
+
+    // A share exists, created through the public write path.
+    let (sk_seed, rnd) = crypto::new_share_seeds();
+    let plaintext = b"material for the control-plane test".to_vec();
+    let stream = encrypted_stream(
+        &sk_seed,
+        &rnd,
+        &meta_json("control.txt", "text/plain", plaintext.len() as u64),
+        &plaintext,
+    )?;
+    let (status, body) = call(&mut app, authorized(post("/api/v1/shares")), stream).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "create: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let created: Value = serde_json::from_slice(&body)?;
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or("no id")?
+        .to_owned();
+    assert!(
+        tokio::fs::try_exists(blob_path(&state.config.data_dir, &id)).await?,
+        "the blob is on the volume"
+    );
+
+    // The full link, exactly as a recipient would hold it.
+    let link = serde_json::json!({ "link": format!("{BASE_URL}/s/{id}#key=x") });
+
+    // The control door answers only its own token: no header, the
+    // upload token, garbage — all 401. The upload token working here
+    // would collapse the two doors into one.
+    for token in [None, Some(ADMIN_TOKEN), Some("nope")] {
+        let mut builder = post("/lookup");
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let (status, body) = call(&mut control, builder, serde_json::to_vec(&link)?).await?;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "wrong control token: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    // The portal loads in a plain browser: GET / carries no token and
+    // still answers the page, dressed in the same headers. A browser
+    // navigation cannot attach an Authorization header, so the page is
+    // a form, not a secret — the token is typed into it.
+    let response = control
+        .clone()
+        .oneshot(get("/").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .contains_key(header::CONTENT_SECURITY_POLICY),
+        "the page is dressed like every public answer"
+    );
+    let page = response.into_body().collect().await?.to_bytes();
+    assert!(
+        String::from_utf8_lossy(&page).contains("Control token"),
+        "the page serves without a token"
+    );
+    // The script the page links loads the same way, or the browser
+    // flow would still be dead.
+    let (status, body) = call(&mut control, get("/assets/control.js"), Vec::new()).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(&body).contains("callControlPlane"),
+        "the portal script serves without a token"
+    );
+    // The API routes keep the gate — the loop above already proved a
+    // tokenless lookup gets nothing — and the gate sits inside the
+    // security headers.
+    let response = control
+        .clone()
+        .oneshot(post("/lookup").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        response
+            .headers()
+            .contains_key(header::CONTENT_SECURITY_POLICY),
+        "the 401 is dressed like every public answer"
+    );
+
+    // Separation of duties, the other direction: the data plane does
+    // not accept the control token either.
+    let (status, _) = call(
+        &mut app,
+        Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/shares")
+            .header(header::AUTHORIZATION, format!("Bearer {CONTROL_TOKEN}")),
+        Vec::new(),
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the control token does not open the data plane"
+    );
+
+    // Lookup by the full link: the fragment is cut away, the row is
+    // found, and no upload token was involved anywhere above.
+    let (status, body) = call(
+        &mut control,
+        control_authorized(post("/lookup")).header(header::CONTENT_TYPE, "application/json"),
+        serde_json::to_vec(&link)?,
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "lookup: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let record: Value = serde_json::from_slice(&body)?;
+    assert_eq!(record.get("id").and_then(Value::as_str), Some(id.as_str()));
+    assert_eq!(record.get("one_time").and_then(Value::as_bool), Some(false));
+    assert_eq!(record.get("downloads").and_then(Value::as_i64), Some(0));
+    assert!(
+        record
+            .get("stored_size")
+            .and_then(Value::as_i64)
+            .is_some_and(|size| size > 0),
+        "the lookup answers the stored size"
+    );
+    assert!(record.get("created_at").is_some() && record.get("expires_at").is_some());
+
+    // The path form and the bare id parse to the same share.
+    for form in [format!("/s/{id}"), id.clone()] {
+        let request = serde_json::json!({ "link": form });
+        let (status, body) = call(
+            &mut control,
+            control_authorized(post("/lookup")).header(header::CONTENT_TYPE, "application/json"),
+            serde_json::to_vec(&request)?,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "link form: {form}");
+        let by_form: Value = serde_json::from_slice(&body)?;
+        assert_eq!(by_form.get("id").and_then(Value::as_str), Some(id.as_str()));
+    }
+
+    // A link whose id would contain a '/' is a 400, and an unknown id
+    // is a 404: the operator learns the paste was wrong, and a scan
+    // learns nothing.
+    let bad = serde_json::json!({ "link": format!("{BASE_URL}/s/{id}/extra") });
+    let (status, _) = call(
+        &mut control,
+        control_authorized(post("/lookup")).header(header::CONTENT_TYPE, "application/json"),
+        serde_json::to_vec(&bad)?,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let unknown = serde_json::json!({ "link": format!("{BASE_URL}/s/does-not-exist") });
+    let (status, _) = call(
+        &mut control,
+        control_authorized(post("/lookup")).header(header::CONTENT_TYPE, "application/json"),
+        serde_json::to_vec(&unknown)?,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Delete: the row and the blob go together, and the answer is the
+    // bookkeeping that stopped existing.
+    let (status, body) = call(
+        &mut control,
+        control_authorized(post("/delete")).header(header::CONTENT_TYPE, "application/json"),
+        serde_json::to_vec(&link)?,
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "delete: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let deleted: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        deleted.get("id").and_then(Value::as_str),
+        Some(id.as_str()),
+        "the delete answers the deleted bookkeeping"
+    );
+
+    // The public side forgot the share, and the volume lost the blob.
+    assert_eq!(
+        status_of(&mut app, &format!("/s/{id}/meta")).await?,
+        StatusCode::NOT_FOUND
+    );
+    assert!(
+        !tokio::fs::try_exists(blob_path(&state.config.data_dir, &id)).await?,
+        "the blob file went with the row"
+    );
+
+    // A second delete finds nothing: 404, not a repeat.
+    let (status, _) = call(
+        &mut control,
+        control_authorized(post("/delete")).header(header::CONTENT_TYPE, "application/json"),
+        serde_json::to_vec(&link)?,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
     let _ = tokio::fs::remove_dir_all(&state.config.data_dir).await;
     Ok(())
 }
