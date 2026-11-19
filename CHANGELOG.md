@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.0](https://github.com/Yornik/secure-file-share/compare/v0.2.0...v0.3.0) (2026-11-19)
+
+
+### ⚠ BREAKING CHANGES
+
+* wire format v2. Frame 0 is a raw 1568-byte ML-KEM-1024 ciphertext and the fragment carries seed+random, so v0.1 links cannot be opened by v0.2 and vice versa. The share_chunks table is dropped by migration 0002; every v0.1 deployment predates production use, so no rows exist to migrate.
+
+### Features
+
+* hybrid post-quantum encryption and a volume blob backend ([31c5020](https://github.com/Yornik/secure-file-share/commit/31c5020ca45005496045ed29c7ed59c0cac3a20d))
+
 ## [0.2.0](https://github.com/Yornik/secure-file-share/compare/v0.1.0...v0.2.0) (2026-11-19)
 
 
