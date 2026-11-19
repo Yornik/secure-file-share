@@ -43,15 +43,14 @@ Operational assumptions:
   the clear.
 
 > [!CAUTION]
-> A deployment that no public network can reach may drop the token
-> (`NOT_PUBLIC_FACING_TURN_OFF_UPLOAD_TOKEN`). The trust then lives in
-> the network alone. On anything the public internet can reach, that
-> switch turns the service into an open, unauditable file-drop on your
-> domain — a malware and illegal-content host — and hosting such content
-> is a crime in many jurisdictions. The zero-knowledge design prevents
-> inspection and filtering, which does not reduce the operator's legal
-> exposure. Keep the switch off unless the network is provably private,
-> and keep a control token configured so revocation stays possible.
+> A deployment that no public network can reach may drop the upload
+> token (`NOT_PUBLIC_FACING_TURN_OFF_UPLOAD_TOKEN`). The network is then
+> the only guard. On a deployment the public internet can reach, the
+> switch turns the service into an open file-drop. Strangers store
+> malware and illegal material on the operator's domain. The operator
+> cannot read what is stored. It is a crime in many countries to host
+> such content. Keep the switch off unless the network is private beyond
+> doubt. Keep the control token set, so revocation stays possible.
 - The database is trusted with bookkeeping and the volume with ciphertext.
   Expiry and burn-after-reading are enforced at claim time in the same
   statement that counts the download, so races cannot double-spend a

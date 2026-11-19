@@ -124,15 +124,14 @@ Do this to run the service locally:
 > `NOT_PUBLIC_FACING_TURN_OFF_UPLOAD_TOKEN` opens the write paths to
 > every client that can reach the service. Set it only on a network that
 > no public route reaches: a tailnet, an isolated LAN, a lab segment.
-> On a public-facing deployment it accepts uploads from anyone on the
-> internet. That turns your domain into an open file-drop for
-> third-party content: malware staging, illegal material, contraband.
-> In many jurisdictions hosting such content is a crime, and this
-> service is zero-knowledge by design — the operator cannot inspect or
-> filter what is stored, which does not reduce the operator's legal
-> exposure. A deployment that drops the upload token must stay
-> unreachable from the public internet for its entire lifetime. If you
-> are not certain the network qualifies, keep the token on.
+> On a public deployment, the service accepts uploads from anyone on the
+> internet. The domain then hosts content from strangers: malware,
+> illegal material, illegal goods. In many countries, this content is a
+> crime to host. This service is zero-knowledge. The operator cannot
+> inspect or filter the stored data. This fact does not remove the
+> operator's responsibility. A deployment without the upload token must
+> stay unreachable from the public internet. If you are not sure that
+> the network is private, keep the token on.
 
 ### API
 
