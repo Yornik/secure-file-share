@@ -6,7 +6,7 @@ use std::{process::exit, sync::Arc, time::Duration};
 
 use secure_file_share::{
     config::Config,
-    metrics, router,
+    import, metrics, router,
     state::{AppState, Metrics},
     sweep,
 };
@@ -61,18 +61,10 @@ async fn main() {
     log::info!("blob directory ready: {}", config.data_dir);
 
     // One shared client for URL imports: connection pooling, a redirect
-    // cap, and one place where a future timeout policy would live.
-    let http = match reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(3))
-        .connect_timeout(Duration::from_secs(10))
-        .build()
-    {
-        Ok(http) => http,
-        Err(error) => {
-            log::error!("HTTP client construction failed: {error}");
-            exit(1);
-        }
-    };
+    // cap, and one place where a future timeout policy would live. The
+    // client carries the import guard: its resolver answers only with
+    // public addresses unless the operator opted in.
+    let http = import::http_client(config.import_allow_private_urls);
 
     // One instance of the counters, shared by the handlers and the
     // sweeper: the metrics listener is the only window into both.

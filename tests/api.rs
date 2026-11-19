@@ -26,7 +26,7 @@ use secure_file_share::{
     config::Config,
     crypto,
     frame::put_frame,
-    metrics, router,
+    import, metrics, router,
     state::{AppState, Metrics, blob_path},
 };
 
@@ -35,15 +35,22 @@ const BASE_URL: &str = "http://test.local";
 
 /// A complete state wired to the test database and a throwaway blob
 /// directory, with size limits tuned down so they are testable.
-/// The default state: the upload token guards the write paths.
+/// The default state: the upload token guards the write paths, and
+/// private import hosts are allowed (the URL-import test fetches from
+/// a loopback upstream).
 async fn setup() -> Result<Option<(AppState, Router)>, Box<dyn Error>> {
-    setup_with(false).await
+    setup_with(false, true).await
 }
 
 /// `not_public = true` builds the state of a deployment that set
-/// `NOT_PUBLIC_FACING_TURN_OFF_UPLOAD_TOKEN`: no token, and the write paths
-/// are open to whatever network can reach them.
-async fn setup_with(not_public: bool) -> Result<Option<(AppState, Router)>, Box<dyn Error>> {
+/// `NOT_PUBLIC_FACING_TURN_OFF_UPLOAD_TOKEN`: no token, and the write
+/// paths are open to whatever network can reach them.
+/// `allow_private` mirrors `SFS_IMPORT_ALLOW_PRIVATE_URLS`: `true` the
+/// way a tailnet deployment would set it, `false` the guarded default.
+async fn setup_with(
+    not_public: bool,
+    allow_private: bool,
+) -> Result<Option<(AppState, Router)>, Box<dyn Error>> {
     let Ok(database_url) = std::env::var("SFS_TEST_DATABASE_URL") else {
         log::warn!("SFS_TEST_DATABASE_URL is not set; skipping integration tests");
         return Ok(None);
@@ -79,9 +86,7 @@ async fn setup_with(not_public: bool) -> Result<Option<(AppState, Router)>, Box<
         // tests; the plain data-plane state does not start one.
         control_token: String::new(),
         control_addr: "127.0.0.1:18081".parse()?,
-        // The URL-import tests run a loopback upstream, so they opt in to
-        // private hosts the way a tailnet deployment would.
-        import_allow_private_urls: true,
+        import_allow_private_urls: allow_private,
         base_url: BASE_URL.to_owned(),
         max_upload_bytes: 1_000_000,
         import_max_bytes: 1_000_000,
@@ -93,7 +98,9 @@ async fn setup_with(not_public: bool) -> Result<Option<(AppState, Router)>, Box<
         config: config.clone(),
         pool,
         metrics: std::sync::Arc::new(Metrics::default()),
-        http: reqwest::Client::new(),
+        // The real client the binary runs, guard included: the tests
+        // exercise the same wiring a deployment gets.
+        http: import::http_client(allow_private),
     };
     let app = router::app(state.clone());
     Ok(Some((state, app)))
@@ -607,6 +614,86 @@ async fn metrics_expose_the_new_series() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// The SSRF guard: with `SFS_IMPORT_ALLOW_PRIVATE_URLS` off, an import
+/// from a loopback upstream is refused before any bytes move, the
+/// error names the opt-in, and nothing is stored. The upstream runs
+/// and is reachable — the refusal is about its address, not its
+/// availability.
+#[tokio::test]
+async fn ssrf_guard_refuses_private_imports() -> Result<(), Box<dyn Error>> {
+    let Some((state, mut app)) = setup_with(false, false).await? else {
+        return Ok(());
+    };
+
+    let payload = b"private network bytes".to_vec();
+    let upstream = axum::Router::new().route(
+        "/file.bin",
+        axum::routing::get(move || {
+            let payload = payload.clone();
+            async move { ([(header::CONTENT_TYPE, "text/plain")], payload) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, upstream).await {
+            log::error!("upstream test server failed: {error}");
+        }
+    });
+
+    // The literal form of the host: hyper connects to an IP literal
+    // without asking any resolver, so the pre-fetch check is the only
+    // door this request goes through.
+    let request = serde_json::json!({ "url": format!("http://{addr}/file.bin") });
+    let (status, body) = call(
+        &mut app,
+        authorized(post("/api/v1/shares/url")).header(header::CONTENT_TYPE, "application/json"),
+        serde_json::to_vec(&request)?,
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a loopback import is refused: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        String::from_utf8_lossy(&body).contains("SFS_IMPORT_ALLOW_PRIVATE_URLS"),
+        "the refusal names the opt-in: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // The name form: `localhost` resolves to loopback, so the same
+    // guard fires on the resolution path too.
+    let port = addr.port();
+    let request = serde_json::json!({ "url": format!("http://localhost:{port}/file.bin") });
+    let (status, body) = call(
+        &mut app,
+        authorized(post("/api/v1/shares/url")).header(header::CONTENT_TYPE, "application/json"),
+        serde_json::to_vec(&request)?,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        String::from_utf8_lossy(&body).contains("SFS_IMPORT_ALLOW_PRIVATE_URLS"),
+        "the by-name refusal names the opt-in: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // Refusal means refusal: no share exists afterwards.
+    let (status, body) = call(&mut app, authorized(get("/api/v1/shares")), Vec::new()).await?;
+    assert_eq!(status, StatusCode::OK);
+    let listed: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        listed.as_array().map(Vec::len),
+        Some(0),
+        "a refused import stores nothing"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&state.config.data_dir).await;
+    Ok(())
+}
+
 /// The admin token is compared in constant time and rejects quietly.
 #[tokio::test]
 async fn wrong_tokens_get_no_details() -> Result<(), Box<dyn Error>> {
@@ -676,7 +763,7 @@ async fn oversize_is_refused() -> Result<(), Box<dyn Error>> {
 /// exactly as in token mode.
 #[tokio::test]
 async fn not_public_mode_opens_uploads_only() -> Result<(), Box<dyn Error>> {
-    let Some((state, mut app)) = setup_with(true).await? else {
+    let Some((state, mut app)) = setup_with(true, false).await? else {
         return Ok(());
     };
 

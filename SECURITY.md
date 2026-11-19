@@ -31,8 +31,11 @@ The service has exactly two doors, and their promises differ:
   The endpoint (upload-token only) fetches a file the server can reach and
   encrypts it with a fresh key. During the import the plaintext transits
   the process once; the key exists in process memory until it is returned
-  in the link. The database still only ever stores ciphertext. Documented in
-  the README, on the upload form, and in the code (`src/import.rs`).
+  in the link. The database still only ever stores ciphertext. Imports
+  refuse private addresses by default; the operator can opt in for a
+  trusted tailnet with `SFS_IMPORT_ALLOW_PRIVATE_URLS`, so the fetch cannot
+  be aimed at the server's own networks. Documented in the README, on the
+  upload form, and in the code (`src/import.rs`).
 
 Operational assumptions:
 
