@@ -111,7 +111,7 @@ Do this to run the service locally:
 |---|---|
 | `DATABASE_URL` | Postgres DSN. Required. |
 | `SFS_UPLOAD_TOKEN` | Bearer token for the write paths. Required, 16 characters or more. The comparison is constant-time. `SFS_ADMIN_TOKEN`, the name before v0.4, still works. |
-| `NOT_PUBLIC_FACING_TURN_OFF_UPLOAD_TOKEN` | Set to `1` for a deployment no public network can reach. The write paths accept uploads without a token. The name is the warning: route nothing public to this service while it is set. |
+| `NOT_PUBLIC_FACING_TURN_OFF_UPLOAD_TOKEN` | Set to `1` for a deployment no public network can reach. The write paths accept uploads without a token. Read the red warning below before you set it. |
 | `SFS_BASE_URL` | Origin for share links. Required. |
 | `SFS_DATA_DIR` | Directory for the ciphertext blobs. Default: `/var/lib/secure-file-share`. Mount a volume here. |
 | `SFS_LISTEN_ADDR` / `SFS_METRICS_ADDR` | Web listener and metrics listener. Defaults: `0.0.0.0:8080` / `0.0.0.0:9090`. |
@@ -119,6 +119,20 @@ Do this to run the service locally:
 | `SFS_IMPORT_MAX_BYTES` | Plaintext cap for one URL import. Default: 2 GiB. |
 | `SFS_DEFAULT_TTL_DAYS` / `SFS_MAX_TTL_DAYS` | Lifetime in days. Defaults: 7 / 90. A value above the maximum clamps. |
 | `SFS_SWEEP_SECS` | Sweeper interval in seconds. Default: 3600. |
+
+> [!CAUTION]
+> `NOT_PUBLIC_FACING_TURN_OFF_UPLOAD_TOKEN` opens the write paths to
+> every client that can reach the service. Set it only on a network that
+> no public route reaches: a tailnet, an isolated LAN, a lab segment.
+> On a public-facing deployment it accepts uploads from anyone on the
+> internet. That turns your domain into an open file-drop for
+> third-party content: malware staging, illegal material, contraband.
+> In many jurisdictions hosting such content is a crime, and this
+> service is zero-knowledge by design — the operator cannot inspect or
+> filter what is stored, which does not reduce the operator's legal
+> exposure. A deployment that drops the upload token must stay
+> unreachable from the public internet for its entire lifetime. If you
+> are not certain the network qualifies, keep the token on.
 
 ### API
 
