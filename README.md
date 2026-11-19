@@ -117,6 +117,7 @@ Do this to run the service locally:
 | `SFS_LISTEN_ADDR` / `SFS_METRICS_ADDR` | Web listener and metrics listener. Defaults: `0.0.0.0:8080` / `0.0.0.0:9090`. |
 | `SFS_MAX_UPLOAD_BYTES` | Ciphertext cap per share. Default: 2 GiB. |
 | `SFS_IMPORT_MAX_BYTES` | Plaintext cap for one URL import. Default: 2 GiB. |
+| `SFS_IMPORT_ALLOW_PRIVATE_URLS` | Set to `1` to let URL imports reach private, loopback and link-local addresses. Default: off. Use it only on a network you trust, for example a tailnet. |
 | `SFS_DEFAULT_TTL_DAYS` / `SFS_MAX_TTL_DAYS` | Lifetime in days. Defaults: 7 / 90. A value above the maximum clamps. |
 | `SFS_SWEEP_SECS` | Sweeper interval in seconds. Default: 3600. |
 
@@ -200,6 +201,11 @@ current: crates, actions, base images, digests.
 - A URL import weakens the guarantee. The plaintext passes through the
   server one time. Download the file yourself and use a browser upload
   when this is not acceptable.
+- A URL import cannot probe the server's own networks. The import fetch
+  connects only to public addresses by default. Loopback, RFC 1918,
+  link-local and cloud metadata addresses are refused. The operator can
+  opt in to private sources with `SFS_IMPORT_ALLOW_PRIVATE_URLS`. Use
+  this only on a trusted network, for example a tailnet.
 - Rate limiting is not built in. The production deployment uses the
   Traefik fail2ban middleware. Share ids carry 128 bits, so a walk of the
   share list is not practical.
