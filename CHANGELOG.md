@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.0](https://github.com/Yornik/secure-file-share/compare/v0.1.0...v0.2.0) (2026-11-19)
+
+
+### Features
+
+* cap file names at 120 characters in both upload paths ([fd42a9c](https://github.com/Yornik/secure-file-share/commit/fd42a9c1eb4a7df043c0e1ea273559c9e6c25e16))
+
+
+### Documentation
+
+* screenshots in dark mode (the default palette) ([2c0da43](https://github.com/Yornik/secure-file-share/commit/2c0da4356f1c1426cbea4d36353fa848f57aad0c))
+
 ## 0.1.0 (2026-11-19)
 
 
