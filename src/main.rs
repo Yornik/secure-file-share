@@ -74,15 +74,19 @@ async fn main() {
         }
     };
 
+    // One instance of the counters, shared by the handlers and the
+    // sweeper: the metrics listener is the only window into both.
+    let metrics = Arc::new(Metrics::default());
     let state = AppState {
         config: config.clone(),
         pool: pool.clone(),
-        metrics: Arc::new(Metrics::default()),
+        metrics: metrics.clone(),
         http,
     };
 
     tokio::spawn(sweep::run(
         pool.clone(),
+        metrics,
         config.data_dir.clone(),
         config.sweep_interval,
     ));

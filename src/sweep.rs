@@ -3,9 +3,11 @@
 //! storage — a blob file and a bookkeeping row — so an hourly pass is
 //! plenty.
 
-use std::{path::Path, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use sqlx::PgPool;
+
+use crate::state::Metrics;
 
 /// Delete everything past its usefulness:
 /// - bookkeeping rows past `expires_at`, with their blob files;
@@ -14,7 +16,10 @@ use sqlx::PgPool;
 /// - `.tmp-` files older than an hour: the remains of an upload that was
 ///   malformed or died mid-stream, which `ShareWriter` removes itself but
 ///   cannot if the process went down first.
-pub async fn run(pool: PgPool, data_dir: String, interval: Duration) {
+///
+/// `metrics` receives one count per reaped share: without it, a quiet
+/// service and a dead sweeper look the same from outside.
+pub async fn run(pool: PgPool, metrics: Arc<Metrics>, data_dir: String, interval: Duration) {
     loop {
         tokio::time::sleep(interval).await;
         let reaped = match sqlx::query_scalar::<_, String>(
@@ -38,6 +43,10 @@ pub async fn run(pool: PgPool, data_dir: String, interval: Duration) {
             {
                 log::warn!("sweeper could not remove the blob of {id}: {error}");
             }
+            // The row is already deleted, so the share counts as removed
+            // even when the blob file did not follow: the counter is the
+            // honest total of reaped shares, not of tidy ones.
+            Metrics::incr(&metrics.sweeper_removed);
         }
         if !reaped.is_empty() {
             log::info!("sweeper removed {} shares", reaped.len());

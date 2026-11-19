@@ -139,6 +139,15 @@ expiry or by burn, and nothing on the public side can change that. The
 operator revokes a share on the control plane, a separate listener with
 its own token.
 
+### Metrics
+
+The metrics listener serves Prometheus exposition on `SFS_METRICS_ADDR`.
+`sfs_stored_bytes` gives the ciphertext bytes held for live shares.
+`sfs_sweeper_removed_total` counts the shares the sweeper has deleted. A
+Grafana dashboard for every series lives in `dashboards/`; import it and
+choose a Prometheus data source. The ServiceMonitor in the cluster
+already wires this port into Prometheus.
+
 ## Build and test
 
 Install Rust 1.100 or later. Then do this:

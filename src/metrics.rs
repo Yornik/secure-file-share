@@ -36,6 +36,23 @@ async fn serve_metrics(State(state): State<AppState>) -> Response {
             -1
         }
     };
+    // The same live rows, weighed instead of counted: the volume is the
+    // scarce resource, and this is the service's own view of it. The cast
+    // exists because Postgres sums a bigint column into numeric, which
+    // does not decode into i64 without it.
+    let stored = match sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(SUM(stored_size), 0)::bigint FROM shares \
+         WHERE expires_at > now() AND (NOT one_time OR downloads = 0)",
+    )
+    .fetch_one(&state.pool)
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            log::error!("stored-bytes gauge failed: {error}");
+            -1
+        }
+    };
     let body = format!(
         concat!(
             "# HELP sfs_build_info Build information for this binary.\n",
@@ -53,7 +70,13 @@ async fn serve_metrics(State(state): State<AppState>) -> Response {
             "sfs_imports_total{{result=\"error\"}} {err}\n",
             "# HELP sfs_active_shares Shares live right now (not expired, not burned).\n",
             "# TYPE sfs_active_shares gauge\n",
-            "sfs_active_shares {active}\n"
+            "sfs_active_shares {active}\n",
+            "# HELP sfs_stored_bytes Ciphertext bytes held for live shares.\n",
+            "# TYPE sfs_stored_bytes gauge\n",
+            "sfs_stored_bytes {stored}\n",
+            "# HELP sfs_sweeper_removed_total Shares the sweeper deleted (expired or burned).\n",
+            "# TYPE sfs_sweeper_removed_total counter\n",
+            "sfs_sweeper_removed_total {removed}\n"
         ),
         version = env!("CARGO_PKG_VERSION"),
         commit = option_env!("SFS_BUILD_COMMIT").unwrap_or("none"),
@@ -62,6 +85,8 @@ async fn serve_metrics(State(state): State<AppState>) -> Response {
         ok = state.metrics.imports_ok.load(Ordering::Relaxed),
         err = state.metrics.imports_err.load(Ordering::Relaxed),
         active = active,
+        stored = stored,
+        removed = state.metrics.sweeper_removed.load(Ordering::Relaxed),
     );
     Response::builder()
         .status(StatusCode::OK)
