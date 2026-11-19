@@ -29,7 +29,7 @@ env:
 jobs:
   lint:
     name: lint
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -52,7 +52,7 @@ jobs:
 
   test:
     name: test
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     services:
@@ -65,9 +65,12 @@ jobs:
           POSTGRES_USER: sfs
           POSTGRES_PASSWORD: sfs
           POSTGRES_DB: sfs_test
-          # Throwaway database: skip the durability barrier, never do this
-          # to a database you care about.
-          PGOPTIONS: -c fsync=off -c full_page_writes=off -c synchronous_commit=off
+          # NOTE: no PGOPTIONS durability shortcuts here. The service
+          # healthcheck (pg_isready) inherits this environment, and Postgres
+          # 18 refuses a session-level `fsync` change outright ("parameter
+          # cannot be changed now"), which never lets the container report
+          # healthy. The suite runs 4 tests against a database that lives
+          # for the job; letting it fsync costs nothing measurable.
         ports:
           - "127.0.0.1:5432:5432"
         options: >-
@@ -94,7 +97,7 @@ jobs:
     # Every other job uses rust-toolchain.toml, which Renovate moves forward.
     # This one keeps checking the oldest Rust that `rust-version` in
     # Cargo.toml promises, including the MSRV of the locked dependencies.
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -119,7 +122,7 @@ jobs:
 
   supply-chain:
     name: supply-chain
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -136,7 +139,7 @@ jobs:
   dependency-review:
     name: dependency-review
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -148,7 +151,7 @@ jobs:
     name: docker build
     # Proves the Dockerfile (and its aws-lc-rs build, which needs cmake) on
     # every PR, without pushing anything anywhere.
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -170,7 +173,7 @@ jobs:
 
   workflows:
     name: workflows
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -205,7 +208,7 @@ jobs:
     name: ci-ok
     if: always()
     needs: [lint, test, msrv, supply-chain, dependency-review, docker-build, workflows]
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-24.04
     permissions: {}
     steps:
       - name: Every job succeeded or was skipped

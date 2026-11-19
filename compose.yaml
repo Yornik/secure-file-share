@@ -18,10 +18,11 @@ services:
       POSTGRES_USER: sfs
       POSTGRES_PASSWORD: sfs
       POSTGRES_DB: sfs
-      # The data is disposable; skipping the durability barrier makes the
-      # first startup noticeably faster. Never do this to a database you
-      # care about.
-      PGOPTIONS: -c fsync=off -c full_page_writes=off -c synchronous_commit=off
+      # NOTE: no PGOPTIONS durability shortcuts here. The healthcheck below
+      # (pg_isready) inherits this environment, and Postgres 18 refuses a
+      # session-level `fsync` change outright, which never lets the
+      # container report healthy. The database is a tmpfs that
+      # `docker compose down` throws away either way.
     ports:
       # Loopback, not the bare "5432:5432" that Compose reads as 0.0.0.0:
       # the password for this superuser is on the line above, and on Linux
