@@ -27,6 +27,10 @@ pub struct Metrics {
     pub downloads: AtomicU64,
     pub imports_ok: AtomicU64,
     pub imports_err: AtomicU64,
+    /// Shares the sweeper has deleted (expired or burned). Only the number
+    /// lives here; the reclamation it counts is already done, in the
+    /// database and on the volume.
+    pub sweeper_removed: AtomicU64,
 }
 
 impl Metrics {

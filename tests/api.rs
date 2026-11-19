@@ -26,7 +26,7 @@ use secure_file_share::{
     config::Config,
     crypto,
     frame::put_frame,
-    router,
+    metrics, router,
     state::{AppState, Metrics, blob_path},
 };
 
@@ -527,6 +527,82 @@ async fn url_import() -> Result<(), Box<dyn Error>> {
     )
     .await?;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let _ = tokio::fs::remove_dir_all(&state.config.data_dir).await;
+    Ok(())
+}
+
+/// The metrics listener: the operator series are in the exposition, and
+/// the SQL gauge behind `sfs_stored_bytes` agrees with the volume. The
+/// sweeper counter is served and still zero: no pass ran in this test.
+#[tokio::test]
+async fn metrics_expose_the_new_series() -> Result<(), Box<dyn Error>> {
+    let Some((state, mut app)) = setup().await? else {
+        return Ok(());
+    };
+
+    // One authorized upload, so the gauges have something true to count.
+    let (sk_seed, rnd) = crypto::new_share_seeds();
+    let plaintext = b"metrics exposition test".to_vec();
+    let stream = encrypted_stream(
+        &sk_seed,
+        &rnd,
+        &meta_json("metrics.txt", "text/plain", plaintext.len() as u64),
+        &plaintext,
+    )?;
+    let (status, body) = call(&mut app, authorized(post("/api/v1/shares")), stream).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "create: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let created: Value = serde_json::from_slice(&body)?;
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or("no id in response")?
+        .to_owned();
+    let blob_len = tokio::fs::read(blob_path(&state.config.data_dir, &id))
+        .await?
+        .len();
+
+    let mut metrics_app = metrics::metrics_router(state.clone());
+    let (status, body) = call(&mut metrics_app, get("/metrics"), Vec::new()).await?;
+    assert_eq!(status, StatusCode::OK);
+    let exposition = String::from_utf8_lossy(&body).into_owned();
+
+    // One series of the exposition: the value on the line that starts with
+    // this exact name. HELP lines start with `#`, so they never match.
+    let series = |name: &str| {
+        exposition
+            .lines()
+            .find_map(|line| line.strip_prefix(name).map(str::trim))
+            .and_then(|value| value.parse::<i64>().ok())
+    };
+
+    assert!(
+        exposition.contains("sfs_stored_bytes"),
+        "the stored-bytes gauge is served"
+    );
+    assert!(
+        exposition.contains("sfs_sweeper_removed_total"),
+        "the sweeper counter is served"
+    );
+    assert_eq!(
+        series("sfs_active_shares "),
+        Some(1),
+        "the new share is live"
+    );
+    assert_eq!(
+        series("sfs_stored_bytes "),
+        Some(i64::try_from(blob_len)?),
+        "stored bytes equals the blob on the volume"
+    );
+    assert_eq!(
+        series("sfs_sweeper_removed_total "),
+        Some(0),
+        "no sweeper pass ran here"
+    );
     let _ = tokio::fs::remove_dir_all(&state.config.data_dir).await;
     Ok(())
 }
