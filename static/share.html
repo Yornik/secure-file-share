@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Someone shared a file with you</title>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <header>
+    <h1>secure&#8209;file&#8209;share</h1>
+  </header>
+
+  <main>
+    <div id="state" class="state">
+      <p id="state-text">Someone shared a file with you.</p>
+      <p id="state-detail" class="hint"></p>
+    </div>
+
+    <div id="warn" class="warn" hidden>
+      <strong>This share self-destructs.</strong>
+      It can be downloaded exactly once; after that the link is dead.
+      Make sure you have room for it before you start.
+    </div>
+
+    <div id="download-box" hidden>
+      <p id="file-line" class="file-line"></p>
+      <div class="progress" id="progress" hidden>
+        <div class="progress-bar" id="progress-bar"></div>
+        <span id="progress-label"></span>
+      </div>
+      <button id="download" type="button">Decrypt and download</button>
+      <p class="hint">The key is in this page's address, after the <code>#</code>.
+      Your browser decrypts here; the server never sees it.</p>
+    </div>
+
+    <div id="error" class="error" hidden></div>
+  </main>
+
+  <footer>
+    <p>Self-hosted, zero-knowledge file sharing.
+    <a href="https://github.com/Yornik/secure-file-share">Source</a>.</p>
+  </footer>
+
+  <script src="/assets/share.js"></script>
+</body>
+</html>

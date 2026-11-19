@@ -1,0 +1,84 @@
+[package]
+name = "secure-file-share"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT"
+description = "Share a file with one link: the browser encrypts, the server stores ciphertext, and the key never leaves the URL fragment."
+repository = "https://github.com/Yornik/secure-file-share"
+readme = "README.md"
+keywords = ["file-sharing", "encryption", "e2ee", "self-hosted", "zero-knowledge"]
+categories = ["web-programming::http-server"]
+
+[lib]
+name = "secure_file_share"
+path = "src/lib.rs"
+
+[[bin]]
+name = "secure-file-share"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8.9"
+# tokio is pulled in by axum; the features below are what the binary itself uses.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync", "io-util"] }
+# tls-none: the only database this is deployed against is a CloudNativePG cluster
+# inside the same Kubernetes cluster, reached with sslmode=disable. Enabling a TLS
+# backend here would add a C toolchain to the musl build for a connection that
+# never leaves the pod network.
+# derive/macros: not for query! (the runtime query API keeps DATABASE_URL out
+# of the build) but because sqlx::migrate! is defined in sqlx's macros module
+# and forwarded to sqlx-macros, both of which cargo only builds under
+# derive/macros. Without it the migrate! macro does not resolve.
+sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "tls-none", "postgres", "migrate", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+aes-gcm = "0.11.1"
+rand = "0.10.4"
+# Constant-time comparison for the admin bearer token.
+subtle = "2.6.1"
+# The web UI ships inside the binary: no CDN, no build step, works offline.
+rust-embed = { version = "8.14.0", features = ["mime-guess"] }
+base64 = "0.23.1"
+thiserror = "2.0.21"
+futures = "0.3.34"
+bytes = "1.12.2"
+log = "0.4"
+env_logger = "0.11"
+mime_guess = "2.0"
+# URL import only. default-features off: no native-tls (openssl), rustls
+# instead. reqwest 0.13's `rustls` feature pulls the aws-lc-rs provider, a C
+# build — the Docker builder stage installs cmake for it; the final image
+# is still scratch and the binary still needs no system libraries.
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream"] }
+
+[dev-dependencies]
+# Integration tests call the router in-process with `oneshot`.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1.5"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+result_large_err = "allow"
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+wildcard_enum_match_arm = "warn"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "unwind"

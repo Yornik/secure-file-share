@@ -1,0 +1,60 @@
+# Development stack: a throwaway Postgres plus the app.
+#
+#   docker compose up --build
+#   -> http://localhost:8080
+#
+# The database is deliberately ephemeral. Its data directory is a tmpfs, so
+# `docker compose down` leaves nothing behind and every run starts from the
+# migrations rather than from whatever state a previous branch left lying
+# around. Nothing here is meant for production — the real deployment uses a
+# CloudNativePG cluster on the sharkshere Talos host.
+services:
+  postgres:
+    # Matches the major version of the CloudNativePG cluster in production,
+    # so development does not pass on a version the real database would
+    # reject.
+    image: postgres:18-alpine@sha256:ff64c9e3bdf8e2120107d3559de8db314e8305f7e38c5105903c6295876738ff
+    environment:
+      POSTGRES_USER: sfs
+      POSTGRES_PASSWORD: sfs
+      POSTGRES_DB: sfs
+      # The data is disposable; skipping the durability barrier makes the
+      # first startup noticeably faster. Never do this to a database you
+      # care about.
+      PGOPTIONS: -c fsync=off -c full_page_writes=off -c synchronous_commit=off
+    ports:
+      # Loopback, not the bare "5432:5432" that Compose reads as 0.0.0.0:
+      # the password for this superuser is on the line above, and on Linux
+      # a published port is reached before a host firewall gets a say.
+      - "127.0.0.1:5432:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sfs -d sfs"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+
+  sfs:
+    build:
+      context: .
+      args:
+        VERSION: dev
+        COMMIT: local
+    environment:
+      DATABASE_URL: postgres://sfs:sfs@postgres:5432/sfs?sslmode=disable
+      # Writing a token down is safe here and nowhere else: this database
+      # is a tmpfs that `docker compose down` throws away, the port is
+      # published to 127.0.0.1 so nothing off this machine can offer the
+      # token to it, and the line is in a public repository, so everybody
+      # already knows it. A real deployment picks its own.
+      SFS_ADMIN_TOKEN: local-development-token
+      # localhost is a secure context, so WebCrypto (the browser-side
+      # encryption) works out of the box.
+      SFS_BASE_URL: http://localhost:8080
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy

@@ -1,0 +1,27 @@
+# cargo deny --locked check: advisories, bans, licenses, sources.
+# The license list is the set the dependency tree actually needs; anything new
+# fails the build until it is reviewed and allowed here on purpose.
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[bans]
+multiple-versions = "warn"
+
+[licenses]
+version = 2
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

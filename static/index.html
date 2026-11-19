@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>secure-file-share</title>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <header>
+    <h1>secure&#8209;file&#8209;share</h1>
+    <p class="tagline">
+      The file is encrypted in your browser before it leaves this page.
+      The server stores ciphertext only; the key lives in the link's
+      <code>#fragment</code> and is never sent to it.
+    </p>
+  </header>
+
+  <main>
+    <form id="share-form">
+      <label class="drop" id="drop-zone">
+        <input type="file" id="file">
+        <span id="drop-label">Drop a file here, or click to choose one</span>
+      </label>
+
+      <label class="field">
+        <span class="field-label">&hellip;or import from a URL instead</span>
+        <input type="url" id="import-url" placeholder="https://example.org/video.webm" autocomplete="off">
+        <span class="hint">The server fetches this URL and encrypts it — for a URL import
+        the plaintext passes through the server once, unlike a file chosen above.</span>
+      </label>
+
+      <div class="row">
+        <label class="field">
+          <span class="field-label">Expires in</span>
+          <select id="ttl">
+            <option value="1">1 day</option>
+            <option value="7" selected>7 days</option>
+            <option value="30">30 days</option>
+            <option value="90">90 days</option>
+          </select>
+        </label>
+        <label class="check">
+          <input type="checkbox" id="one-time">
+          <span>Burn after reading <span class="hint">(one download, then it is gone)</span></span>
+        </label>
+      </div>
+
+      <label class="field">
+        <span class="field-label">Admin token</span>
+        <input type="password" id="token" autocomplete="off" spellcheck="false">
+        <span class="hint">Kept in this tab's memory only, never written anywhere.</span>
+      </label>
+
+      <button type="submit" id="send">Encrypt and send</button>
+    </form>
+
+    <div id="progress" class="progress" hidden>
+      <div class="progress-bar" id="progress-bar"></div>
+      <span id="progress-label"></span>
+    </div>
+
+    <div id="error" class="error" hidden></div>
+
+    <div id="result" class="result" hidden>
+      <span class="field-label">Share this link — the part after <code>#</code> is the key</span>
+      <div class="link-row">
+        <input id="link" readonly>
+        <button id="copy" type="button">Copy</button>
+      </div>
+      <span class="hint" id="expiry-note"></span>
+    </div>
+  </main>
+
+  <footer>
+    <p>Self-hosted, zero-knowledge for uploads, stateless behind a Postgres
+    database. <a href="https://github.com/Yornik/secure-file-share">Source</a>.</p>
+  </footer>
+
+  <script src="/assets/app.js"></script>
+</body>
+</html>

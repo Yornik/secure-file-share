@@ -1,0 +1,216 @@
+# Continuous integration. `ci-ok` at the bottom is the single required
+# status check: it passes only when every other job succeeded or was
+# skipped, so jobs can be added here without touching branch protection.
+#
+# Every action is pinned to a full commit SHA (comment: the release it came
+# from). Renovate (.github/renovate.json) updates the actions, the pinned
+# tools (cargo-deny, check-jsonschema) and the crates, and merges each
+# update once this workflow is green.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Weekly: new RustSec advisories against the locked dependency set.
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: cargo fmt
+        run: cargo fmt --all --check
+      - name: cargo clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: cargo doc
+        run: cargo doc --locked --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    services:
+      # The same major version as the CloudNativePG cluster in production,
+      # so development does not pass on a version the real database would
+      # reject. Pinned by digest like everything that executes code.
+      postgres:
+        image: postgres:18-alpine@sha256:ff64c9e3bdf8e2120107d3559de8db314e8305f7e38c5105903c6295876738ff
+        env:
+          POSTGRES_USER: sfs
+          POSTGRES_PASSWORD: sfs
+          POSTGRES_DB: sfs_test
+          # Throwaway database: skip the durability barrier, never do this
+          # to a database you care about.
+          PGOPTIONS: -c fsync=off -c full_page_writes=off -c synchronous_commit=off
+        ports:
+          - "127.0.0.1:5432:5432"
+        options: >-
+          --health-cmd "pg_isready -U sfs -d sfs_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    env:
+      SFS_TEST_DATABASE_URL: postgres://sfs:sfs@127.0.0.1:5432/sfs_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: cargo test
+        run: cargo test --locked --all-features
+
+  msrv:
+    name: msrv
+    # Every other job uses rust-toolchain.toml, which Renovate moves forward.
+    # This one keeps checking the oldest Rust that `rust-version` in
+    # Cargo.toml promises, including the MSRV of the locked dependencies.
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the rust-version toolchain from Cargo.toml
+        id: msrv
+        run: |
+          msrv=$(sed -n 's/^rust-version = "\([0-9.]*\)"$/\1/p' Cargo.toml)
+          if [[ ! $msrv =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "::error::cannot read rust-version from Cargo.toml (got '$msrv')"
+            exit 1
+          fi
+          rustup toolchain install "$msrv" --profile minimal
+          echo "msrv=$msrv" >>"$GITHUB_OUTPUT"
+      # `+toolchain` overrides rust-toolchain.toml.
+      - name: cargo check with rust-version
+        env:
+          MSRV: ${{ steps.msrv.outputs.msrv }}
+        run: cargo "+$MSRV" check --locked --all-features
+
+  supply-chain:
+    name: supply-chain
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-deny@0.20.2
+          fallback: none
+      - name: cargo deny (advisories, bans, licenses, sources)
+        run: cargo deny --locked check
+
+  dependency-review:
+    name: dependency-review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: moderate
+
+  docker-build:
+    name: docker build
+    # Proves the Dockerfile (and its aws-lc-rs build, which needs cmake) on
+    # every PR, without pushing anything anywhere.
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build the image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: false
+          build-args: |
+            VERSION=ci
+            COMMIT=${{ github.sha }}
+          # No cache: see the release workflow — a layer restored from the
+          # shared Actions cache must never reach a signed image, and a CI
+          # build has nothing worth caching anyway.
+
+  workflows:
+    name: workflows
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The image bundles shellcheck, so `run:` scripts are checked too.
+      # Renovate updates the tag and the digest together.
+      - name: actionlint
+        uses: docker://rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+        with:
+          args: -color
+      - name: zizmor
+        uses: zizmorcore/zizmor-action@45d7276c9ca790aabd705e31ca99c6185c3e76dd # v0.8.1
+        with:
+          version: 1.31.1
+          advanced-security: false
+          annotations: true
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.7"
+          enable-cache: false
+      - name: Validate renovate.json and release-please-config.json against their schemas
+        run: |
+          uvx --from 'check-jsonschema==0.39.0' check-jsonschema \
+            --builtin-schema vendor.renovate .github/renovate.json
+          uvx --from 'check-jsonschema==0.39.0' check-jsonschema \
+            --schemafile https://raw.githubusercontent.com/googleapis/release-please/v17.11.2/schemas/config.json \
+            release-please-config.json
+
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs: [lint, test, msrv, supply-chain, dependency-review, docker-build, workflows]
+    runs-on: ubuntu-26.04
+    permissions: {}
+    steps:
+      - name: Every job succeeded or was skipped
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+          jq -e 'all(.[]; .result == "success" or .result == "skipped")' <<<"$NEEDS" >/dev/null
