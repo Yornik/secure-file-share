@@ -86,7 +86,11 @@ where
     /// chunk, everything after a data chunk. A stream that stops mid-frame
     /// is an error, not a short share: a downloader would otherwise have
     /// to guess whether the tail is missing.
-    pub async fn next_frame(&mut self) -> Result<Option<Vec<u8>>, FrameError> {
+    ///
+    /// The frame is a `Bytes` view split out of the read buffer, not a
+    /// copy: a 4 MiB data frame costs one buffer, not two, and a flood
+    /// of concurrent uploads costs half the memory it did with `to_vec`.
+    pub async fn next_frame(&mut self) -> Result<Option<Bytes>, FrameError> {
         loop {
             // BytesMut is always one contiguous buffer, so chunk() is the
             // whole unread part and the length checks below are the only
@@ -113,7 +117,7 @@ where
                 }
                 if self.buf.remaining() >= 4 + len {
                     self.buf.advance(4);
-                    let frame = self.buf.split_to(len).to_vec();
+                    let frame = self.buf.split_to(len).freeze();
                     self.frames += 1;
                     self.stored_ct += u64::from(4_u32) + len as u64;
                     if self.stored_ct > self.cap {
