@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/Yornik/secure-file-share/compare/v0.4.0...v0.4.1) (2026-11-19)
+
+
+### Performance Improvements
+
+* zero-copy frame hand-off halves upload peak memory ([#12](https://github.com/Yornik/secure-file-share/issues/12)) ([605ce9c](https://github.com/Yornik/secure-file-share/commit/605ce9ccd9ed5a161ea9a1659dd59e192728d16f))
+
 ## [0.4.0](https://github.com/Yornik/secure-file-share/compare/v0.3.1...v0.4.0) (2026-11-19)
 
 
